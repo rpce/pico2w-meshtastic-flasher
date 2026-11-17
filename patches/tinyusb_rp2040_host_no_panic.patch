@@ -1,0 +1,101 @@
+diff -ruN a/src/portable/raspberrypi/rp2040/hcd_rp2040.c b/src/portable/raspberrypi/rp2040/hcd_rp2040.c
+--- a/src/portable/raspberrypi/rp2040/hcd_rp2040.c	2026-11-17 12:33:25.776565074 +0100
++++ b/src/portable/raspberrypi/rp2040/hcd_rp2040.c	2026-11-17 12:33:25.863805509 +0100
+@@ -307,6 +307,8 @@
+   if (status & USB_INTS_HOST_CONN_DIS_BITS) {
+     uint8_t speed = dev_speed();
+     if (speed == SIE_CTRL_SPEED_DISCONNECT) {
++      // Device gone: stop a possibly active EPX transfer (no busy-wait in IRQ)
++      usb_hw->sie_ctrl = (usb_hw->sie_ctrl & SIE_CTRL_BASE_MASK) | USB_SIE_CTRL_STOP_TRANS_BITS;
+       hcd_event_device_remove(RHPORT_NATIVE, true);
+     } else {
+       if (speed == SIE_CTRL_SPEED_LOW) {
+@@ -394,9 +396,18 @@
+   }
+   #endif
+ 
++  // RESUME interrupt is enabled in hcd_init() but was never handled/cleared.
++  // After a device reset/disconnect the flag stayed set and the IRQ fired forever (main loop starved).
++  if (status & USB_INTS_HOST_RESUME_BITS) {
++    usb_hw_clear->sie_status = USB_SIE_STATUS_RESUME_BITS;
++  }
++
++  // Data sequence error: fail the transfer instead of panic() (device reset/disconnect mid-transfer)
+   if (status & USB_INTS_ERROR_DATA_SEQ_BITS) {
+     usb_hw_clear->sie_status = USB_SIE_STATUS_DATA_SEQ_ERROR_BITS;
+-    panic("Data Seq Error \n");
++    if (epx->state == EPSTATE_ACTIVE) {
++      xfer_complete_isr(epx, XFER_RESULT_FAILED, false);
++    }
+   }
+ }
+ 
+@@ -697,8 +708,8 @@
+   (void)dev_addr;
+   (void)ep_addr;
+ 
+-  panic("hcd_clear_stall");
+-  // return true;
++  // Not supported: return error instead of panic()
++  return false;
+ }
+ 
+ #endif
+diff -ruN a/src/portable/raspberrypi/rp2040/rp2040_usb.c b/src/portable/raspberrypi/rp2040/rp2040_usb.c
+--- a/src/portable/raspberrypi/rp2040/rp2040_usb.c	2026-11-17 12:33:25.778165966 +0100
++++ b/src/portable/raspberrypi/rp2040/rp2040_usb.c	2026-11-17 12:33:25.864013228 +0100
+@@ -117,9 +117,8 @@
+ void __tusb_irq_path_func(bufctrl_write32)(io_rw_32 *buf_reg, uint32_t value) {
+   const uint32_t current    = *buf_reg;
+   const uint32_t avail_mask = USB_BUF_CTRL_AVAIL | (USB_BUF_CTRL_AVAIL << 16);
+-  if (current & value & avail_mask) {
+-    panic("buf_ctrl @ 0x%lX already available", (uintptr_t)buf_reg);
+-  }
++  // Race after device reset/disconnect: overwrite instead of panic("already available")
++  (void)current; (void)avail_mask;
+   *buf_reg = value & ~(USB_BUF_CTRL_AVAIL | (USB_BUF_CTRL_AVAIL << 16)); // write other bits first
+ 
+   // Section 4.1.2.7.1 (rp2040) / 12.7.3.7.1 (rp2350) Concurrent access: after write to buffer control,
+@@ -135,9 +134,8 @@
+ 
+ void __tusb_irq_path_func(bufctrl_write16)(io_rw_16 *buf_reg16, uint16_t value) {
+   const uint16_t current = *buf_reg16;
+-  if (current & value & USB_BUF_CTRL_AVAIL) {
+-    panic("buf_ctrl @ 0x%lX already available", (uintptr_t)buf_reg16);
+-  }
++  // Race after device reset/disconnect: overwrite instead of panic("already available")
++  (void)current;
+   *buf_reg16 = value & (uint16_t)~USB_BUF_CTRL_AVAIL; // write other bits first
+ 
+   // Section 4.1.2.7.1 (rp2040) / 12.7.3.7.1 (rp2350) Concurrent access
+diff -ruN a/src/arduino/ports/rp2040/tusb_config_rp2040.h b/src/arduino/ports/rp2040/tusb_config_rp2040.h
+--- a/src/arduino/ports/rp2040/tusb_config_rp2040.h	2026-11-17 22:32:37.212530078 +0100
++++ b/src/arduino/ports/rp2040/tusb_config_rp2040.h	2026-11-17 22:32:37.199462528 +0100
+@@ -157,19 +157,22 @@
+ #define CFG_TUH_CDC_CP210X 1
+ #define CFG_TUH_CDC_CH34X 1
+ 
++///// RX & TX fifo size
++///#define CFG_TUH_CDC_RX_BUFSIZE 128
++///#define CFG_TUH_CDC_TX_BUFSIZE 128
+ // RX & TX fifo size
+-#define CFG_TUH_CDC_RX_BUFSIZE 128
+-#define CFG_TUH_CDC_TX_BUFSIZE 128
++#define CFG_TUH_CDC_RX_BUFSIZE 4096
++#define CFG_TUH_CDC_TX_BUFSIZE 1024
+ 
+ // Set Line Control state on enumeration/mounted:
+ // DTR ( bit 0), RTS (bit 1)
+-#define CFG_TUH_CDC_LINE_CONTROL_ON_ENUM 0x03
++///#define CFG_TUH_CDC_LINE_CONTROL_ON_ENUM 0x03
+ 
+ // Set Line Coding on enumeration/mounted, value for cdc_line_coding_t
+ // bit rate = 115200, 1 stop bit, no parity, 8 bit data width
+ // This need Pico-PIO-USB at least 0.5.1
+-#define CFG_TUH_CDC_LINE_CODING_ON_ENUM                                        \
+-  { 115200, CDC_LINE_CODING_STOP_BITS_1, CDC_LINE_CODING_PARITY_NONE, 8 }
++///#define CFG_TUH_CDC_LINE_CODING_ON_ENUM                                        \
++///  { 115200, CDC_LINE_CODING_STOP_BITS_1, CDC_LINE_CODING_PARITY_NONE, 8 }
+ 
+ #ifdef __cplusplus
+ }

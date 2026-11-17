@@ -1,0 +1,17 @@
+# Konfiguracje wezlow - zawieraja klucze prywatne i PSK kanalow!
+*.yaml
+*.yml
+*.cfg
+# Firmware, pakiety, serwer aktualizacji
+*.bin
+*.mtpk
+*.mt.json
+*.uf2
+mtnod.txt
+# Python
+.pico_meshtastic_env/
+__pycache__/
+*.pyc
+# Logi
+logi_pico_*/
+*.log
