@@ -22,6 +22,7 @@
 #include <pico/mutex.h>
 #include <hardware/watchdog.h>
 #include <hardware/structs/watchdog.h>
+#include <hardware/structs/usb.h>
 #include <stdarg.h>
 #include <time.h>
 #include <sys/time.h>
@@ -62,7 +63,9 @@ const char*  MDNS_NAME    = "pico-flasher";         // w trybie STA: http://pico
 // cmd[]: nazwy komend LoRa (zmieniane na stronie): wlacz, uspij, AP wlacz, AP wylacz, temperatura
 static const char* const CMD_KEYS[5] = { "cmd_on", "cmd_sleep", "cmd_ap_on", "cmd_ap_off", "cmd_temp" };
 static const char* const CMD_DEF[5]  = { "WLACZ_PICO", "USPIJ_PICO", "WLACZ_TRYB_AP", "WYLACZ_TRYB_AP", "TEMP_PICO" };
-struct Settings { String apSsid, apPass, token, staSsid, staPass, senders, url; bool sta; int ch; bool logOn; String cmd[5]; } cfg;
+// brakOdp: minuty ciszy wezla do odzyskiwania (0 = wylaczone); rstPin: GPIO impulsu resetu wezla (-1 = brak), rstHigh: aktywny stan wysoki
+struct Settings { String apSsid, apPass, token, staSsid, staPass, senders, url; bool sta; int ch; bool logOn; String cmd[5];
+                  int brakOdp, rstPin, rstSek; bool rstHigh; } cfg;
 const char* PICO_BIN = "pico.bin";                 // aktualizacja programu Pico (przed restartem)
 static const char* upPath = "/fw.pkg";             // dokad trafia odbierany plik (pakiet albo aktualizacja Pico)
 // Stan Wi-Fi: 0 = wlaczone wg ustawien, 1 = uspione (Wi-Fi wylaczone), 2 = staly AP dla wezlow (UDP)
@@ -76,6 +79,7 @@ static volatile uint32_t txtId = 0, txtFrom = 0; static volatile int txtCh = -1;
 // Kolejka wiadomosci LoRa (odpowiedzi, raporty): wysyla rdzen 1, najwczesniejsza pierwsza, min. 5 s odstepu
 struct LoraMsg { char txt[201]; uint32_t at, born; bool needName; };
 struct Sha256 { uint32_t h[8]; uint8_t buf[64]; uint64_t len; size_t n; };   // podpis mtnod.txt (u gory - prototypy Arduino)
+static bool gpioOk(int p) { return p == -1 || (p >= 0 && p <= 22) || (p >= 26 && p <= 28); }   // GP23-25, 29: modul Wi-Fi
 static LoraMsg loraQ[8]; static volatile uint8_t loraQn = 0;
 auto_init_mutex(loraQMtx);
 // Komenda odebrana na rdzeniu 1 (tekst calej wiadomosci), wykonywana na rdzeniu 0 (ustawienia, Wi-Fi)
@@ -107,7 +111,7 @@ const char*  PICO_DL_PATH = "/pico_dl.bin";  // program Pico pobrany z internetu
 const char*  PICO_LORA_FLAG = "/pico_lora.txt";  // aktualizacja Pico z LoRa: po restarcie potwierdz przez LoRa
 
 // ---- Komunikacja między rdzeniami ----
-// reqCmd: 1 reset RTS, 2 bootloader, 4 restart hosta, 5 test bootloadera, 6 flashowanie
+// reqCmd: 1 reset RTS, 2 bootloader, 4 restart hosta, 5 test bootloadera, 6 flashowanie, 7 konfiguracja, 8 test pinu resetu
 static volatile uint8_t  reqCmd = 0;
 static volatile uint32_t core1Beat = 0;
 
@@ -129,6 +133,7 @@ static String pkgMode = "";                        // tryb pakietu z opisu ("akt
 static volatile uint32_t ackId = 0;                // potwierdzenie komendy (Routing.request_id)
 static volatile uint8_t  ackErr = 0;
 static const uint8_t API_DISC[] = { 0x94, 0xC3, 0x00, 0x02, 0x20, 0x01 };   // ToRadio.disconnect
+static const uint8_t API_WANTCFG[] = { 0x94, 0xC3, 0x00, 0x03, 0x18, 0xB9, 0x60 };   // want_config_id = 12345
 static volatile bool     apiMode = false;
 static volatile uint32_t apiNodeNum = 0;    // z my_info (FromRadio)
 static volatile bool     apiConfigDone = false;
@@ -141,13 +146,14 @@ const char* CFG_PENDING_PATH = "/cfg.pending";     // konfiguracja do wyslania p
 static const uint32_t CFG_BOOT_WAIT_MS = 60000;    // pierwszy start wezla: klucze, zapis plikow, GPS, BT
 static const uint32_t CFG_RETRY_WAIT_MS = 30000;   // przed ponowieniem konfiguracji
 static const uint32_t ACK_TIMEOUT_MS = 8000;       // np. zmiana regionu LoRa przestawia radio - trwa
-#define PICO_VER "0.24"
+#define PICO_VER "0.27"
 const char PICO_VER_TAG[] = "PICOVER=" PICO_VER;    // znacznik w pliku .bin - skrypt odczytuje z niego wersje
 const char* PICO_VERSION = PICO_VER_TAG + 8;
 static volatile uint32_t picoRebootAt = 0;         // zaplanowany restart Pico (przycisk / skrypt)
 
 // Slad ostatniego kroku w rejestrze watchdoga (przetrwa restart z watchdoga)
 static const uint32_t CRUMB_MAGIC = 0x50494331;
+#define PLANNED_MAGIC 0x52455354u   // watchdog scratch[2]: restart na zadanie (nie zawieszenie)
 enum { CR_IDLE = 0, CR_USB_DEINIT, CR_USB_INIT, CR_BOOTWAIT, CR_API, CR_CFG, CR_FLASH, CR_REBOOTWAIT, CR_UPLOAD };
 static const char* const CRUMB_NAMES[] = { "praca normalna", "restart hosta USB (deinit)", "restart hosta USB (init)",
   "czekanie na start wezla", "laczenie API", "wysylanie konfiguracji", "flashowanie ESP", "czekanie na restart wezla",
@@ -294,7 +300,17 @@ void tuh_cdc_umount_cb(uint8_t idx) {
 bool hcd_port_connect_status(uint8_t rhport);
 }
 
-void restartUsbHost() {
+// Czy na linii USB jest fizycznie urzadzenie (podciagniete D+/D-), niezaleznie od logow i enumeracji.
+// Rejestr SIE_STATUS.SPEED w trybie host: 0 = brak urzadzenia, 1 = LS, 2 = FS.
+bool usbDevicePresent() { return (usb_hw->sie_status & USB_SIE_STATUS_SPEED_BITS) != 0; }
+
+// Restart hosta USB tylko gdy jest urzadzenie: wielokrotne restarty przy pustej linii zawieszaly
+// TinyUSB (rdzen 1 stawal, watchdog restartowal Pico) - sprawdzone w testach 0.26.
+bool restartUsbHost() {
+  if (!usbDevicePresent()) {
+    logText("[PICO] Brak urzadzenia na linii USB - restart hosta pominiety\n");
+    return false;
+  }
   logText("\n[PICO] Restart hosta USB...\n");
   crumb(CR_USB_DEINIT);
   tuh_deinit(0);
@@ -306,6 +322,7 @@ void restartUsbHost() {
   crumb(CR_USB_INIT);
   tusb_init(0, &rh);
   logText("[PICO] Host USB uruchomiony ponownie\n");
+  return true;
 }
 
 // =========================================================================
@@ -709,9 +726,8 @@ bool apiConnect() {
   fwSet(fwPct < 92 ? 92 : fwPct, "Polaczenie API z wezlem");
   apiNodeNum = 0; apiConfigDone = false; apiFrames = 0;
   apiMode = true;
-  static const uint8_t wantCfg[] = { 0x94, 0xC3, 0x00, 0x03, 0x18, 0xB9, 0x60 };   // want_config_id = 12345
   for (int i = 0; i < 3 && !apiNodeNum; i++) {
-    if (!usbWriteAll(wantCfg, sizeof(wantCfg))) return false;
+    if (!usbWriteAll(API_WANTCFG, sizeof(API_WANTCFG))) return false;
     uint32_t t0 = millis();
     while (millis() - t0 < 8000 && !apiNodeNum) apiPump(50);
   }
@@ -1134,7 +1150,7 @@ bool flashPackage() {
 // RDZEŃ 0: Wi-Fi + strona WWW + przyjmowanie pakietu
 // =========================================================================
 const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>Pico2W flasher ESP32-S3</title></head>
+<title>Pico2W flasher</title></head>
 <body style="font-family:sans-serif;background:#111;color:#eee;margin:15px">
 <h3>Pico 2 W - host USB / flasher ESP32-S3 <span id="ver" style="font-weight:normal;font-size:13px;color:#888"></span></h3>
 <div id="st">...</div>
@@ -1151,7 +1167,7 @@ TRWA ODBIOR PAKIETU FIRMWARE - strona nie odpytuje Pico, zeby nie przeszkadzac. 
 <button onclick="tick()" style="margin-left:15px;padding:4px 12px">Sprawdz stan teraz</button></div>
 <div id="login" style="display:none;position:fixed;inset:0;background:#000d;z-index:20">
  <div style="max-width:320px;margin:15vh auto;background:#223;padding:20px;border:2px solid #58f">
-  <b>Pico2W flasher ESP32-S3</b><p>Haslo:</p>
+  <b>Pico2W flasher</b><p>Haslo:</p>
   <input id="pw" type="password" style="width:100%;padding:6px" onkeydown="if(event.key=='Enter')zaloguj()">
   <p><button onclick="zaloguj()" style="padding:6px 18px">Zaloguj</button> <span id="lerr" style="color:#f66"></span></p>
  </div></div>
@@ -1178,9 +1194,15 @@ TRWA ODBIOR PAKIETU FIRMWARE - strona nie odpytuje Pico, zeby nie przeszkadzac. 
  <tr><td>Komenda: temperatura</td><td><input id="c4" maxlength="20"></td></tr>
  <tr><td>Dozwoleni nadawcy</td><td><input id="sSnd" placeholder="np. ed819a48,0c838131 (puste = wszyscy)" style="width:260px"></td></tr>
  <tr><td>Adres pliku mtnod.txt</td><td><input id="sUrl" placeholder="https:&#47;&#47;serwer/komin/mtnod.txt (puste = brak)" style="width:260px"></td></tr>
+ <tr><td>Brak odpowiedzi wezla (min)</td><td><input id="sOdp" type="number" min="0" max="1440" style="width:70px"> <span style="color:#aaa">(0 = wylaczone, 5-1440)</span></td></tr>
+ <tr><td>Pin resetu wezla (GP)</td><td><input id="sRp" type="number" min="-1" max="28" style="width:50px">
+   <select id="sRh"><option value="1">aktywny stan wysoki</option><option value="0">aktywny stan niski</option></select>
+   impuls <input id="sRs" type="number" min="1" max="60" style="width:45px"> s <span style="color:#aaa">(-1 = brak)</span></td></tr>
  </table>
  <p style="color:#aaa;font-size:12px">Komendy wysyla sie jako wiadomosc tekstowa na kanale komend (wielkosc liter bez znaczenia; 3-20 znakow, bez spacji, kazda inna).
  Domyslne: WLACZ_PICO, USPIJ_PICO, WLACZ_TRYB_AP, WYLACZ_TRYB_AP, TEMP_PICO. Pico odpowiada na kanale krotka wiadomoscia.</p>
+ <p style="color:#aaa;font-size:12px">Brak odpowiedzi wezla: gdy przez tyle minut z USB nie przyjda zadne dane, Pico pyta wezel przez API. Jesli nie odpowie:
+ restart hosta USB, potem reset RTS, na koncu impuls na pinie resetu (max 3 na dobe). Pin steruje zewnetrznym ukladem (np. tranzystor odcinajacy zasilanie wezla).</p>
  <button onclick="zapiszUst()" style="padding:6px 14px">Zapisz i zrestartuj Pico</button>
  <button onclick="act('Przywrocic WSZYSTKIE ustawienia domyslne (AP, hasla, kanal) i zrestartowac Pico?','/settings_reset')" style="padding:6px 14px;background:#a33;color:#fff">Ustawienia domyslne</button>
  <p style="color:#aaa;font-size:12px">W trybie STA, gdy Pico nie polaczy sie z siecia w 30 s, uruchomi AP. Krotkie nacisniecie BOOTSEL restartuje wezel; przytrzymanie 30 s przywraca ustawienia domyslne Pico.</p>
@@ -1188,6 +1210,7 @@ TRWA ODBIOR PAKIETU FIRMWARE - strona nie odpytuje Pico, zeby nie przeszkadzac. 
 <div style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0">
 <button onclick="act('Zrestartowac host USB w Pico?','/reinit')" style="padding:6px 14px">Restart hosta USB</button>
 <button onclick="act('Zresetowac wezel ESP32-S3?','/hreset')" style="padding:6px 14px">Reset ESP32-S3 (RTS)</button>
+<button id="bRst" onclick="act('Wyslac impuls resetu na pin '+rstFiz+'? Uklad podlaczony do pinu zresetuje wezel (np. odetnie mu zasilanie na '+rstSek+' s).','/rst_test')" style="padding:6px 14px">Reset wezla (pin 20)</button>
 <button onclick="act('Przelaczyc ESP32-S3 w bootloader? Wezel przestanie dzialac do resetu.','/hboot')" style="padding:6px 14px">ESP32-S3 w bootloader</button>
 <button onclick="act('Uruchomic test bootloadera? Wezel na chwile przestanie dzialac.','/chiptest')" style="padding:6px 14px;background:#ff0">Test bootloadera</button>
 <button id="flBtn" onclick="flashBtn()" style="padding:6px 14px;background:#f80">Flashuj pakiet z Pico</button>
@@ -1262,7 +1285,7 @@ async function zaloguj(){
 function logout(){ TOK=''; try{ sessionStorage.removeItem('tok'); }catch(e){} location.reload(); }
 function linki(){ document.getElementById('dl1').href='/download?t='+encodeURIComponent(TOK);
   document.getElementById('dl2').href='/download_pico?t='+encodeURIComponent(TOK);
-  document.getElementById('dl3').href='/download_flash?t='+encodeURIComponent(TOK); }
+  document.getElementById('dl3').href='/download_flash?t='+encodeURIComponent(TOK); rstLabel(); }
 async function act(pytanie, url){
   if(!confirm(pytanie)) return;
   try{
@@ -1284,7 +1307,14 @@ function flashBtn(){
   else
     act('Wgrac pakiet z Pico (tryb: ' + (pkgTryb || 'nieznany') + ')?','/fw_flash');
 }
-let setOn=false;
+let setOn=false, rstFiz=20, rstSek=5;
+async function rstLabel(){ try{
+  const t=await (await F('/settings')).text(), v={};
+  t.split('\n').forEach(l=>{const i=l.indexOf('='); if(i>0) v[l.substring(0,i)]=l.substring(i+1);});
+  const gp=parseInt(v.rst_pin||'-1'), P=[1,2,4,5,6,7,9,10,11,12,14,15,16,17,19,20,21,22,24,25,26,27,29];
+  rstFiz = gp>=0&&gp<=22 ? P[gp] : ({26:31,27:32,28:34})[gp]||'?'; rstSek=v.rst_sek||'5';
+  const b=document.getElementById('bRst'); b.textContent='Reset wezla (pin '+rstFiz+')'; b.style.display=gp<0?'none':'';
+}catch(e){} }
 async function togSet(){
   setOn=!setOn; document.getElementById('setp').style.display=setOn?'block':'none';
   document.getElementById('setBtn').textContent='Ustawienia: '+(setOn?'UKRYJ':'POKAZ');
@@ -1294,6 +1324,9 @@ async function togSet(){
   document.getElementById('sApS').value=v.ap_ssid||''; document.getElementById('sStS').value=v.sta_ssid||'';
   document.getElementById(v.sta=='1'?'mSTA':'mAP').checked=true;
   document.getElementById('sCh').value=v.ch||'1'; document.getElementById('sSnd').value=v.senders||''; document.getElementById('sUrl').value=v.url||'';
+  document.getElementById('sOdp').value=v.brak_odp||'0'; document.getElementById('sRp').value=v.rst_pin||'-1';
+  document.getElementById('sRs').value=v.rst_sek||'5'; document.getElementById('sRh').value=v.rst_hi||'1';
+  rstLabel();
   ['cmd_on','cmd_sleep','cmd_ap_on','cmd_ap_off','cmd_temp'].forEach((k,i)=>document.getElementById('c'+i).value=v[k]||'');
   ['sApP','sStP','sTok'].forEach(id=>document.getElementById(id).value='');
 }
@@ -1301,7 +1334,7 @@ async function zapiszUst(){
   const g=id=>document.getElementById(id).value;
   const sta=document.getElementById('mSTA').checked?'1':'0';
   if(!confirm('Zapisac ustawienia i zrestartowac Pico?'+(sta=='1'?'\nPico przejdzie w tryb STA - strona bedzie pod innym adresem.':''))) return;
-  const b=new URLSearchParams({ap_ssid:g('sApS'),ap_pass:g('sApP'),token:g('sTok'),sta:sta,sta_ssid:g('sStS'),sta_pass:g('sStP'),ch:g('sCh'),senders:g('sSnd'),url:g('sUrl'),
+  const b=new URLSearchParams({ap_ssid:g('sApS'),ap_pass:g('sApP'),token:g('sTok'),sta:sta,sta_ssid:g('sStS'),sta_pass:g('sStP'),ch:g('sCh'),senders:g('sSnd'),url:g('sUrl'),brak_odp:g('sOdp'),rst_pin:g('sRp'),rst_sek:g('sRs'),rst_hi:g('sRh'),
     cmd_on:g('c0'),cmd_sleep:g('c1'),cmd_ap_on:g('c2'),cmd_ap_off:g('c3'),cmd_temp:g('c4')});
   const r=await F('/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});
   const txt=await r.text(); alert(txt);
@@ -1344,7 +1377,7 @@ async function tick(){
                    : pkgTryb.indexOf('pelna') >= 0 ? 'Pelna instalacja firmware' : 'Flashuj pakiet z Pico';
     fb.style.display = st.indexOf('pakiet: KOMPLETNY') >= 0 ? '' : 'none';
     const ip = st.match(/\| IP ([0-9.]+)/), tp = st.match(/temp Pico ([0-9.-]+)/);
-    if (ip) document.title = 'Pico2W flasher ESP32-S3, IP ' + ip[1] + (tp ? ', ' + tp[1] + '\u00B0C' : '');
+    if (ip) document.title = 'Pico2W flasher, IP ' + ip[1] + (tp ? ', ' + tp[1] + '\u00B0C' : '');
     document.getElementById('logBtn').textContent = 'Zbieranie logow: ' + (st.indexOf('logi: zbierane')>=0 ? 'WL (kliknij by wylaczyc)' : 'WYL (kliknij by wlaczyc)');
     document.getElementById('st').textContent = st;
     document.getElementById('apOff').style.display = st.indexOf('TRYB AP DLA WEZLOW') >= 0 ? '' : 'none';
@@ -1691,6 +1724,7 @@ void handleFwStatus() {
 void loadSettings() {
   cfg.apSsid = DEF_AP_SSID; cfg.apPass = DEF_AP_PASS; cfg.token = DEF_TOKEN;
   cfg.staSsid = ""; cfg.staPass = ""; cfg.sta = false; cfg.ch = 1; cfg.senders = ""; cfg.url = ""; cfg.logOn = true;
+  cfg.brakOdp = 0; cfg.rstPin = 15; cfg.rstSek = 5; cfg.rstHigh = true;
   for (int i = 0; i < 5; i++) cfg.cmd[i] = CMD_DEF[i];
   File f = LittleFS.open(SETTINGS_PATH, "r");
   if (!f) { logText("[PICO] Ustawienia: BRAK PLIKU - uzywam domyslnych\n"); return; }
@@ -1709,6 +1743,10 @@ void loadSettings() {
     else if (k == "senders") cfg.senders = v;
     else if (k == "url") cfg.url = v;
     else if (k == "log") cfg.logOn = (v != "0");
+    else if (k == "brak_odp") cfg.brakOdp = constrain(v.toInt(), 0, 1440);
+    else if (k == "rst_pin" && gpioOk(v.toInt())) cfg.rstPin = v.toInt();
+    else if (k == "rst_sek") cfg.rstSek = constrain(v.toInt(), 1, 60);
+    else if (k == "rst_hi") cfg.rstHigh = (v != "0");
     else for (int i = 0; i < 5; i++) if (k == CMD_KEYS[i] && v.length()) cfg.cmd[i] = v;
   }
   f.close();
@@ -1720,6 +1758,7 @@ bool saveSettings() {
            cfg.staPass.c_str(), cfg.ch, cfg.senders.c_str(), cfg.logOn ? 1 : 0);
   for (int i = 0; i < 5; i++) f.printf("%s=%s\n", CMD_KEYS[i], cfg.cmd[i].c_str());
   f.printf("url=%s\n", cfg.url.c_str());
+  f.printf("brak_odp=%d\nrst_pin=%d\nrst_sek=%d\nrst_hi=%d\n", cfg.brakOdp, cfg.rstPin, cfg.rstSek, cfg.rstHigh ? 1 : 0);
   f.close(); return true;
 }
 void handleSettingsGet() {      // hasel nie odsylamy
@@ -1727,7 +1766,8 @@ void handleSettingsGet() {      // hasel nie odsylamy
   server.send(200, "text/plain", String("ap_ssid=") + cfg.apSsid + "\nsta=" + (cfg.sta ? "1" : "0") +
               "\nsta_ssid=" + cfg.staSsid + "\nch=" + String(cfg.ch) + "\nsenders=" + cfg.senders + "\nurl=" + cfg.url + "\n" +
               CMD_KEYS[0] + "=" + cfg.cmd[0] + "\n" + CMD_KEYS[1] + "=" + cfg.cmd[1] + "\n" + CMD_KEYS[2] + "=" + cfg.cmd[2] +
-              "\n" + CMD_KEYS[3] + "=" + cfg.cmd[3] + "\n" + CMD_KEYS[4] + "=" + cfg.cmd[4] + "\n");
+              "\n" + CMD_KEYS[3] + "=" + cfg.cmd[3] + "\n" + CMD_KEYS[4] + "=" + cfg.cmd[4] + "\n" +
+              "brak_odp=" + cfg.brakOdp + "\nrst_pin=" + cfg.rstPin + "\nrst_sek=" + cfg.rstSek + "\nrst_hi=" + (cfg.rstHigh ? "1" : "0") + "\n");
 }
 bool urlOk(const String& u) {
   return (u.startsWith("http://") || u.startsWith("https://")) && u.length() > 10 && u.length() <= 190 && u.indexOf(' ') < 0;
@@ -1744,6 +1784,10 @@ void handleSettingsPost() {
   if (server.hasArg("ch"))      n.ch = constrain(server.arg("ch").toInt(), 0, 7);
   if (server.hasArg("senders")) { n.senders = server.arg("senders"); n.senders.replace(" ", ""); n.senders.toLowerCase(); }
   if (server.hasArg("url"))     { n.url = server.arg("url"); n.url.trim(); }
+  if (server.hasArg("brak_odp")) n.brakOdp = server.arg("brak_odp").toInt();
+  if (server.hasArg("rst_pin"))  n.rstPin = server.arg("rst_pin").length() ? server.arg("rst_pin").toInt() : -1;
+  if (server.hasArg("rst_sek"))  n.rstSek = server.arg("rst_sek").toInt();
+  if (server.hasArg("rst_hi"))   n.rstHigh = server.arg("rst_hi") != "0";
   for (int i = 0; i < 5; i++)
     if (server.hasArg(CMD_KEYS[i]) && server.arg(CMD_KEYS[i]).length()) { n.cmd[i] = server.arg(CMD_KEYS[i]); n.cmd[i].trim(); n.cmd[i].toUpperCase(); }
   String err;
@@ -1754,6 +1798,9 @@ void handleSettingsPost() {
   else if (n.sta && n.staPass.length() && n.staPass.length() < 8) err = "Haslo sieci STA: min. 8 znakow";
   else if (n.senders.length() && n.senders.indexOf(',') < 0) err = "Filtr wezlow: puste (wszyscy) albo min. 2 wezly";
   else if (n.url.length() && !urlOk(n.url)) err = "Adres mtnod.txt: http://... albo https://..., max 190 znakow, bez spacji";
+  else if (n.brakOdp != 0 && (n.brakOdp < 5 || n.brakOdp > 1440)) err = "Brak odpowiedzi wezla: 0 (wylaczone) albo 5-1440 min";
+  else if (!gpioOk(n.rstPin)) err = "Pin resetu: -1 (brak), GP0-GP22 albo GP26-GP28";
+  else if (n.rstSek < 1 || n.rstSek > 60) err = "Czas impulsu resetu: 1-60 s";
   for (const String* v : { &n.apSsid, &n.apPass, &n.token, &n.staSsid, &n.staPass, &n.senders, &n.url })
     if (v->indexOf('\n') >= 0 || v->indexOf('=') == 0) err = "Niedozwolony znak";
   for (int i = 0; i < 5 && !err.length(); i++) {
@@ -1763,9 +1810,19 @@ void handleSettingsPost() {
     for (int j = 0; j < i; j++) if (n.cmd[i] == n.cmd[j]) err = "Komendy musza byc rozne";
   }
   if (err.length()) { server.send(400, "text/plain", err); return; }
+  bool wifiZmiana = n.apSsid != cfg.apSsid || n.apPass != cfg.apPass || n.sta != cfg.sta ||
+                    n.staSsid != cfg.staSsid || n.staPass != cfg.staPass;
+  int staryPin = cfg.rstPin;
   cfg = n;
   if (!saveSettings()) { server.send(500, "text/plain", "Blad zapisu"); return; }
-  logText("[PICO] Zapisano nowe ustawienia - restart Pico\n");
+  if (!wifiZmiana) {                                   // bez zmian Wi-Fi: zmiany dzialaja od razu, bez restartu Pico
+    if (staryPin != cfg.rstPin) { if (staryPin >= 0) pinMode(staryPin, INPUT); rstPinIdle(); }
+    else rstPinIdle();                                 // stan aktywny mogl sie zmienic
+    logText("[PICO] Zapisano nowe ustawienia - dzialaja od razu (bez restartu)\n");
+    server.send(200, "text/plain", "Zapisano. Zmiany dzialaja od razu (Wi-Fi bez zmian - bez restartu Pico).");
+    return;
+  }
+  logText("[PICO] Zapisano nowe ustawienia Wi-Fi - restart Pico\n");
   picoRebootAt = millis() + 1500;
   server.sendHeader("Connection", "close");
   server.send(200, "text/plain", String("Zapisano. Pico uruchomi sie ponownie za chwile.\n") +
@@ -1838,7 +1895,7 @@ void checkBootselReset() {
       { File r = LittleFS.open("/reset.why", "w"); if (r) { r.print("przytrzymanie BOOTSEL 30 s"); r.close(); } }
       logText("[PICO] BOOTSEL 30 s - przywrocono ustawienia domyslne\n");
       delay(200);
-      rp2040.reboot();
+      plannedReboot();
     }
   } else if (held) {
     uint32_t d = millis() - held;
@@ -1956,7 +2013,7 @@ void setup() {
     case RP2040::PWRON_RESET:    bootReason = "wlaczenie zasilania"; break;
     case RP2040::RUN_PIN_RESET:  bootReason = "pin RUN"; break;
     case RP2040::SOFT_RESET:     bootReason = "programowy"; break;
-    case RP2040::WDT_RESET:      bootReason = "WATCHDOG"; break;
+    case RP2040::WDT_RESET:      bootReason = watchdog_hw->scratch[2] == PLANNED_MAGIC ? "restart na zadanie (strona/skrypt/LoRa/BOOTSEL)" : "WATCHDOG"; break;
     case RP2040::DEBUG_RESET:    bootReason = "debugger"; break;
     case RP2040::GLITCH_RESET:   bootReason = "GLITCH (zaklocenie zasilania)"; break;
     case RP2040::BROWNOUT_RESET: bootReason = "BROWNOUT (spadek napiecia!)"; break;
@@ -1965,7 +2022,9 @@ void setup() {
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1); tzset();  // czas polski - takze dla czasu z sieci LoRa
   logf("[PICO] Wersja programu Pico: %s\n", PICO_VERSION);
   logf("[PICO] Przyczyna startu: %s\n", bootReason);
-  if (rp2040.getResetReason() == RP2040::WDT_RESET) {   // restart programowy tez idzie przez watchdog - pomijamy go
+  bool naZadanie = rp2040.getResetReason() == RP2040::WDT_RESET && watchdog_hw->scratch[2] == PLANNED_MAGIC;
+  watchdog_hw->scratch[2] = 0;
+  if (rp2040.getResetReason() == RP2040::WDT_RESET && !naZadanie) {
     logText("[PICO] *** START PO RESTARCIE Z WATCHDOGA ***\n");
     if (watchdog_hw->scratch[1] == CRUMB_MAGIC) {
       uint32_t c = watchdog_hw->scratch[0] & 0xFF, x = watchdog_hw->scratch[0] >> 8;
@@ -1998,6 +2057,7 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
 
   loadSettings();
+  rstPinIdle();                   // pin resetu wezla w stanie nieaktywnym od startu
   rp2040.wdt_begin(8000);         // wczesniej: laczenie STA moze trwac do 30 s (karmione w petli)
   core1Beat = millis();
   startWifi();
@@ -2022,6 +2082,8 @@ void setup() {
   server.on("/hreset",   HTTP_POST, [akcja]() { akcja(1, "Reset ESP32-S3 wykonany"); });
   server.on("/hboot",    HTTP_POST, [akcja]() { akcja(2, "ESP32-S3 przelaczony w bootloader"); });
   server.on("/chiptest", HTTP_POST, [akcja]() { akcja(5, "Test bootloadera uruchomiony - wynik w zdarzeniach Pico"); });
+  server.on("/rst_test", HTTP_POST, [akcja]() { if (cfg.rstPin < 0) { server.send(400, "text/plain", "Pin resetu wylaczony (-1) - ustaw go w ustawieniach"); return; }
+    akcja(8, "Impuls na pinie resetu wyslany - opis w zdarzeniach Pico"); });
   server.on("/pkg_crc",  []() { if (!needAuth()) return;
     server.send(200, "text/plain", LittleFS.exists(PKG_OK_PATH) ? readFileStr(PKG_OK_PATH) : String("")); });
   server.on("/logcollect", HTTP_POST, []() { if (!needAuth()) return;
@@ -2075,8 +2137,26 @@ void setup() {
   rp2040.wdt_begin(8000);
 }
 
+// Restart na zadanie: znacznik w rejestrze watchdoga (przezywa restart), zeby po starcie nie pokazywac "WATCHDOG"
+void plannedReboot() { watchdog_hw->scratch[2] = PLANNED_MAGIC; rp2040.reboot(); }
+
+// Rdzen 1 (USB) nie odpowiada: zapis do zdarzen i logu we flash, zanim watchdog zrestartuje Pico
+void core1Check() {
+  static uint8_t zgloszen = 0;
+  uint32_t beat = core1Beat;                   // najpierw odczyt bicia rdzenia 1, potem zegar (inaczej "ujemna" roznica)
+  int32_t ile = (int32_t)(millis() - beat);
+  if (ile < 4000) return;
+  if (zgloszen >= 1 || fwState == 1) return;   // raz na start Pico (oszczedzamy flash)
+  zgloszen++;
+  uint32_t c = watchdog_hw->scratch[0] & 0xFF;
+  logf("[PICO] *** Rdzen 1 (USB) nie odpowiada od %lu s, krok: %s, urzadzenie na USB: %s - zapis logu przed restartem ***\n",
+       (unsigned long)(ile / 1000), c < sizeof(CRUMB_NAMES) / sizeof(CRUMB_NAMES[0]) ? CRUMB_NAMES[c] : "?",
+       usbDevicePresent() ? "tak" : "nie");
+  flushLogToFlash("zawieszenie rdzenia 1");
+}
+
 void loop() {
-  if (millis() - core1Beat < 3000) rp2040.wdt_reset();
+  { uint32_t beat = core1Beat; if ((int32_t)(millis() - beat) < 3000) rp2040.wdt_reset(); }
   if (wifiState != 1) {
     if (!staActive) dnsServer.processNextRequest();
     else MDNS.update();
@@ -2088,7 +2168,8 @@ void loop() {
   checkBootselReset();
   ledService();
   logFlashService();
-  if (picoRebootAt && (int32_t)(millis() - picoRebootAt) > 0) rp2040.reboot();
+  if (picoRebootAt && (int32_t)(millis() - picoRebootAt) > 0) plannedReboot();
+  core1Check();
 }
 
 // =========================================================================
@@ -2109,6 +2190,98 @@ void resetNodeFull() {
   waitNodeBoot();
 }
 
+// ---- Straznik wezla: BRAK_ODPOWIEDZI ----
+// Cisza na USB przez cfg.brakOdp minut -> pytanie przez API (wezel po uzyciu API do 15 min nie wysyla logow).
+// Brak odpowiedzi -> restart hosta USB -> reset RTS -> impuls na pinie resetu (max 3 na dobe).
+static uint32_t rstPulseAt[3] = { 0, 0, 0 };
+void rstPinIdle() {
+  if (cfg.rstPin < 0) return;
+  digitalWrite(cfg.rstPin, cfg.rstHigh ? LOW : HIGH);
+  pinMode(cfg.rstPin, OUTPUT);
+  digitalWrite(cfg.rstPin, cfg.rstHigh ? LOW : HIGH);
+}
+void rstPulse() {
+  if (cfg.rstPin < 0) { logText("[PICO] Pin resetu wylaczony (-1) - impuls pominiety\n"); return; }
+  logf("\n[PICO] Impuls resetu wezla: GP%d w stanie %s przez %d s\n", cfg.rstPin, cfg.rstHigh ? "wysokim" : "niskim", cfg.rstSek);
+  digitalWrite(cfg.rstPin, cfg.rstHigh ? HIGH : LOW);
+  uint32_t t0 = millis();
+  while (millis() - t0 < (uint32_t)cfg.rstSek * 1000UL) apiPump(100);
+  digitalWrite(cfg.rstPin, cfg.rstHigh ? LOW : HIGH);
+  logf("[PICO] Impuls resetu zakonczony (GP%d nieaktywny)\n", cfg.rstPin);
+}
+// Krotkie zapytanie API: czy wezel zyje (odpowiada my_info), potem rozlaczenie
+bool apiProbe() {
+  if (cdcIdx == 0xFF) return false;
+  lastApiUse = millis();
+  apiNodeNum = 0; apiConfigDone = false; apiFrames = 0;
+  apiMode = true;
+  bool ok = false;
+  for (int i = 0; i < 2 && !ok; i++) {
+    if (!usbWriteAll(API_WANTCFG, sizeof(API_WANTCFG))) break;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 6000 && !apiNodeNum) apiPump(50);
+    ok = apiNodeNum != 0;
+  }
+  if (ok) { uint32_t t0 = millis(); while (millis() - t0 < 15000 && !apiConfigDone) apiPump(50); }
+  usbWriteAll(API_DISC, sizeof(API_DISC)); apiPump(300);
+  apiMode = false;
+  return ok;
+}
+// Czy wezel zyje po kroku odzyskiwania: nowe dane z USB albo odpowiedz na API
+bool nodeAliveAfter(uint32_t since, uint32_t waitMs) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < waitMs) {
+    uint32_t r = lastRxMs;
+    if (cdcIdx != 0xFF && r && (int32_t)(r - since) > 0) return true;
+    apiPump(200);
+  }
+  return apiProbe();
+}
+void nodeWatchService() {
+  static uint32_t lastCheck = 0;
+  if (!cfg.brakOdp || fwState == 1 || seq || millis() < 180000) return;
+  uint32_t now = millis(), lim = (uint32_t)cfg.brakOdp * 60000UL, rx = lastRxMs, api = lastApiUse;
+  // po uzyciu API wezel do 15 min nie wysyla logow - inaczej sprawdzanie co kilka minut samo podtrzymywaloby cisze
+  uint32_t apiQuiet = lim > 1200000UL ? lim : 1200000UL;
+  if (now - rx < lim || now - lastCheck < lim || (api && now - api < apiQuiet)) return;
+  lastCheck = now;
+  uint32_t cisza = rx ? (now - rx) / 60000UL : now / 60000UL;
+  if (heltecMounted && apiProbe()) {
+    logf("[PICO] Straznik: %lu min bez logow, wezel odpowiada na API - wszystko w porzadku\n", (unsigned long)cisza);
+    lastCheck = millis(); return;
+  }
+  logf("\n[PICO] Straznik: wezel nie odpowiada od %lu min%s - odzyskiwanie\n", (unsigned long)cisza,
+       cdcIdx == 0xFF ? " (nie widac go na USB)" : "");
+  String pomoglo;
+  uint32_t t = millis();
+  if (usbDevicePresent()) {
+    logText("[PICO] Straznik krok 1/3: restart hosta USB\n");
+    if (restartUsbHost() && nodeAliveAfter(t, 60000)) pomoglo = "restart USB";
+  } else logText("[PICO] Straznik: brak urzadzenia na linii USB (wezel bez zasilania?) - kroki 1-2 pominiete\n");
+  if (!pomoglo.length() && cdcIdx != 0xFF) {
+    logText("[PICO] Straznik krok 2/3: reset wezla RTS\n");
+    t = millis(); resetNodeFull();
+    if (nodeAliveAfter(t, 90000)) pomoglo = "reset RTS";
+  }
+  if (!pomoglo.length()) {
+    int wolny = -1, uzyte = 0;
+    for (int i = 0; i < 3; i++) { if (rstPulseAt[i] && millis() - rstPulseAt[i] < 86400000UL) uzyte++; else if (wolny < 0) wolny = i; }
+    if (cfg.rstPin < 0) logText("[PICO] Straznik krok 3/3: pin resetu wylaczony - pomijam\n");
+    else if (wolny < 0) logf("[PICO] Straznik krok 3/3: wykorzystany limit %d impulsow resetu na dobe - pomijam\n", uzyte);
+    else {
+      logText("[PICO] Straznik krok 3/3: impuls na pinie resetu\n");
+      rstPulseAt[wolny] = millis();
+      t = millis(); rstPulse(); waitNodeBoot();
+      if (nodeAliveAfter(t, 120000)) pomoglo = String("impuls GP") + cfg.rstPin;
+    }
+  }
+  lastCheck = millis();
+  if (pomoglo.length()) {
+    logf("[PICO] Straznik: wezel znow odpowiada - pomogl %s\n", pomoglo.c_str());
+    queueLora(String("PICO: wezel nie odpowiadal ") + cisza + " min - pomogl " + pomoglo, 60000);
+  } else logf("[PICO] Straznik: wezel nadal nie odpowiada - kolejna proba za %d min\n", cfg.brakOdp);
+}
+
 void loop1() {
   core1Beat = millis();
   USBHost.task();
@@ -2118,11 +2291,19 @@ void loop1() {
   // restart hosta USB po 6, 15 i 30 s, dopoki wezel sie nie pojawi
   static uint8_t bootUsbTries = 0;
   static const uint32_t BOOT_USB_AT[3] = { 6000, 15000, 30000 };
-  if (bootUsbTries < 3 && !heltecMounted && fwState != 1 && millis() > BOOT_USB_AT[bootUsbTries]) {
+  static uint32_t presentSince = 0;
+  if (usbDevicePresent()) { if (!presentSince) presentSince = millis(); } else presentSince = 0;
+  if (bootUsbTries < 3 && !heltecMounted && fwState != 1 && millis() > BOOT_USB_AT[bootUsbTries] &&
+      presentSince && millis() - presentSince > 3000) {
     bootUsbTries++;
     logf("[PICO] Wezel nie widoczny na USB po starcie - restart hosta USB (%u/3)\n", bootUsbTries);
     restartUsbHost();
   } else if (bootUsbTries < 3 && heltecMounted) bootUsbTries = 3;   // wezel jest - koniec sprawdzania
+  static bool pustaZgloszona = false;
+  if (!pustaZgloszona && !heltecMounted && !presentSince && millis() > 6000) {
+    pustaZgloszona = true;
+    logText("[PICO] Brak urzadzenia na linii USB - czekam na wezel (bez restartow hosta)\n");
+  }
 
   // Po aktualizacji programu Pico: reset wezla (jak przycisk "Reset ESP32-S3"), potem host USB restartuje sie sam
   if (resetNodeAfterUpdate && heltecMounted && !seq && fwState != 1 && millis() > 8000) {
@@ -2161,6 +2342,7 @@ void loop1() {
     else if (cmd == 5) { seq = nullptr; bootloaderTest(); }
     else if (cmd == 6) { seq = nullptr; flashPackage(); }
     else if (cmd == 7) { seq = nullptr; configFromPackage(); }
+    else if (cmd == 8) rstPulse();
   }
 
   runSeq();
@@ -2168,9 +2350,11 @@ void loop1() {
   bootReportService();
   loraQService();
 
-  // Straznik: ESP32-S3 podlaczony, a od 5 min zadnych danych (Meshtastic loguje co minute)
+  nodeWatchService();     // BRAK_ODPOWIEDZI > 0: wykrywanie zawieszenia wezla i odzyskiwanie
+
+  // Prosty straznik (BRAK_ODPOWIEDZI = 0): ESP32-S3 podlaczony, a od 5 min zadnych danych (Meshtastic loguje co minute)
   static uint32_t lastFix = 0;
-  if (heltecMounted && fwState != 1 && millis() - lastRxMs > 300000 && millis() - lastFix > 300000 &&
+  if (!cfg.brakOdp && heltecMounted && fwState != 1 && millis() - lastRxMs > 300000 && millis() - lastFix > 300000 &&
       millis() - lastApiUse > 1200000) {               // po uzyciu API wezel do 15 min nie wysyla tekstu - to nie awaria USB
     logText("[PICO] 5 min bez danych z ESP32-S3 - restart hosta USB\n");
     lastFix = millis();
@@ -2231,9 +2415,9 @@ void loraCmdService() {
       break;
     }
   }
-  static const char* const SET_KEYS[] = { "AP_SSID", "AP_PWD", "STA_SSID", "STA_PWD", "MODE_WIFI", "FILTR_NODE", "ADRES_URL" };
+  static const char* const SET_KEYS[] = { "AP_SSID", "AP_PWD", "STA_SSID", "STA_PWD", "MODE_WIFI", "FILTR_NODE", "ADRES_URL", "BRAK_ODPOWIEDZI" };
   int setIdx = -1, cmdIdx = -1;
-  if (hasVal) for (int i = 0; i < 7; i++) if (key == SET_KEYS[i]) setIdx = i;
+  if (hasVal) for (int i = 0; i < 8; i++) if (key == SET_KEYS[i]) setIdx = i;
   if (!hasVal) for (int i = 0; i < 5; i++) if (cfg.cmd[i] == key) cmdIdx = i;
   bool help = !hasVal && key == "HELP", wersje = !hasVal && key == "WERSJE";
   bool dl = hasVal && key == "POBIERZ_INTERNET", upd = !hasVal && key == "AKTUALIZUJ_INTERNET";
@@ -2245,10 +2429,12 @@ void loraCmdService() {
     String l = "PICO komendy: HELP";
     for (int i = 0; i < 5; i++) l += ", " + cfg.cmd[i];
     queueLora(l, 0);                                         // 1/5: komendy
-    queueLora("PICO ustawienia: WERSJE, AP_SSID:, AP_PWD:, STA_SSID:, STA_PWD:, MODE_WIFI:AP/STA, FILTR_NODE:, ADRES_URL:, "
+    queueLora("PICO ustawienia: WERSJE, AP_SSID:, AP_PWD:, STA_SSID:, STA_PWD:, MODE_WIFI:AP/STA, FILTR_NODE:, ADRES_URL:, BRAK_ODPOWIEDZI:, "
               "POBIERZ_INTERNET:pelna/aktualizacja/pico, AKTUALIZUJ_INTERNET", 0);   // 2/5
     queueLora(statusLine(), 0);                              // 3/5: Wi-Fi
-    queueLora(String("PICO: filtr wezlow: ") + (cfg.senders.length() ? cfg.senders : String("wszyscy")), 0);   // 4/5
+    queueLora(String("PICO: filtr wezlow: ") + (cfg.senders.length() ? cfg.senders : String("wszyscy")) + "; BRAK_ODPOWIEDZI: " +
+              (cfg.brakOdp ? String(cfg.brakOdp) + " min, pin resetu " + (cfg.rstPin >= 0 ? "GP" + String(cfg.rstPin) : String("brak"))
+                           : String("wylaczone")), 0);   // 4/5
     String di = readFileStr(DL_INFO_PATH); di.trim();
     int p1 = di.indexOf('|'), p2 = di.indexOf('|', p1 + 1);
     String co = (p1 > 0 && p2 > p1) ? di.substring(0, p1) + " " + di.substring(p1 + 1, p2) : String("nic");
@@ -2321,6 +2507,11 @@ void loraCmdService() {
   } else if (setIdx == 6) {                                   // ADRES_URL
     if (!urlOk(val)) err = "podaj http://... albo https://... (max 190 znakow, bez spacji)";
     else cfg.url = val;
+  } else if (setIdx == 7) {                                   // BRAK_ODPOWIEDZI (minuty, 0 = wylaczone)
+    bool num = val.length() > 0; for (size_t i = 0; i < val.length(); i++) if (!isdigit(val[i])) num = false;
+    int m = num ? val.toInt() : -1;
+    if (m != 0 && (m < 5 || m > 1440)) err = "podaj 0 (wylaczone) albo 5-1440 minut";
+    else { cfg.brakOdp = m; shown = m ? String(m) + " min" : String("0 (wylaczone)"); }
   } else if (setIdx == 5) {                                   // FILTR_NODE
     String v = val; v.toLowerCase(); v.replace(" ", ","); v.replace(";", ",");
     String out; int cnt = 0;
@@ -2483,13 +2674,29 @@ static void hmacSha256(const char* key, size_t kl, const char* msg, size_t ml, u
 // Linia: typ|wersja|plik|rozmiar|crc32 ; podpis=HMAC-SHA256(token, "typ|wersja|rozmiar|crc\n" ... ) w kolejnosci z pliku
 static const char* const DL_TYPES[3] = { "pelna", "aktualizacja", "pico" };
 static uint8_t dlBuf[2048];
+static String urlHost(const String& u) {
+  int b = u.indexOf("://"); b = b < 0 ? 0 : b + 3;
+  int e = b; while (e < (int)u.length() && u[e] != '/' && u[e] != ':') e++;
+  return u.substring(b, e);
+}
 static bool httpOpen(HTTPClient& http, const String& url, String& err) {
+  String host = urlHost(url), plik = url.substring(url.lastIndexOf('/') + 1);
+  IPAddress ip;
+  if (!host.length() || !WiFi.hostByName(host.c_str(), ip)) { err = "DNS: nie znaleziono serwera " + host + " (adres albo brak internetu)"; return false; }
   http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (url.startsWith("https://")) http.setInsecure();      // szyfrowanie bez sprawdzania certyfikatu - chroni podpis
   if (!http.begin(url)) { err = "zly adres"; return false; }
   int code = http.GET();
-  if (code != 200) { err = String("HTTP ") + code + " " + url.substring(url.lastIndexOf('/') + 1); http.end(); return false; }
+  if (code == HTTPC_ERROR_CONNECTION_FAILED)
+    err = url.startsWith("https://") ? "brak polaczenia z " + host + " (port 443) albo serwer nie obsluguje TLS 1.2 - sprobuj http://"
+                                     : "serwer " + host + " nie odpowiada (port 80)";
+  else if (code == HTTPC_ERROR_READ_TIMEOUT) err = "serwer " + host + " nie odpowiedzial w 20 s";
+  else if (code < 0) err = String("polaczenie z ") + host + " przerwane (blad " + code + ")";
+  else if (code == 404) err = "brak pliku " + plik + " na serwerze (HTTP 404)";
+  else if (code == 401 || code == 403) err = "brak dostepu do " + plik + " (HTTP " + code + ")";
+  else if (code != 200) err = String("HTTP ") + code + " " + plik;
+  if (code != 200) { http.end(); return false; }
   return true;
 }
 static bool netFail(const String& err) {
