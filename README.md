@@ -17,7 +17,6 @@ Szczegóły: **[docs/Pico2W_flasher_instrukcja.pdf](docs/Pico2W_flasher_instrukc
 | Plik | Opis |
 |---|---|
 | `pico2w_flasher_meshtastic/pico2w_flasher_meshtastic.ino` | program Pico 2 W (Arduino) |
-| `wyslij_firmware.py` | skrypt PC: budowa pakietu, wysyłanie, logi, serwer aktualizacji |
 | `patches/tinyusb_rp2040_host_no_panic.patch` | poprawka TinyUSB host (RP2350) |
 | `docs/` | instrukcja PDF i zdjęcia |
 
