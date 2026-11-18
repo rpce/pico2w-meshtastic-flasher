@@ -12,8 +12,6 @@ Raspberry Pi Pico 2 W podłączone przez USB do węzła Meshtastic na ESP32-S3 (
 
 Szczegóły: **[docs/Pico2W_flasher_instrukcja.pdf](docs/Pico2W_flasher_instrukcja.pdf)**
 
-![Montaż](docs/zdjecia/montaz.jpg)
-
 ## Pliki
 
 | Plik | Opis |
