@@ -23,6 +23,8 @@
 #include <hardware/watchdog.h>
 #include <hardware/structs/watchdog.h>
 #include <hardware/structs/usb.h>
+#include <hardware/structs/powman.h>
+#include <hardware/gpio.h>
 #include <stdarg.h>
 #include <time.h>
 #include <sys/time.h>
@@ -65,7 +67,8 @@ static const char* const CMD_KEYS[5] = { "cmd_on", "cmd_sleep", "cmd_ap_on", "cm
 static const char* const CMD_DEF[5]  = { "WLACZ_PICO", "USPIJ_PICO", "WLACZ_TRYB_AP", "WYLACZ_TRYB_AP", "TEMP_PICO" };
 // brakOdp: minuty ciszy wezla do odzyskiwania (0 = wylaczone); rstPin: GPIO impulsu resetu wezla (-1 = brak), rstHigh: aktywny stan wysoki
 struct Settings { String apSsid, apPass, token, staSsid, staPass, senders, url; bool sta; int ch; bool logOn; String cmd[5];
-                  int brakOdp, rstPin, rstSek; bool rstHigh; } cfg;
+                  int brakOdp, rstPin, rstSek; bool rstHigh;
+                  String pmTime; int pmCzuw; } cfg;   // POWMAN: "0" / "12" (co 12 h) / "6,18" (o godzinach) / "5m" (test); czuwanie min
 const char* PICO_BIN = "pico.bin";                 // aktualizacja programu Pico (przed restartem)
 static const char* upPath = "/fw.pkg";             // dokad trafia odbierany plik (pakiet albo aktualizacja Pico)
 // Stan Wi-Fi: 0 = wlaczone wg ustawien, 1 = uspione (Wi-Fi wylaczone), 2 = staly AP dla wezlow (UDP)
@@ -79,6 +82,23 @@ static volatile uint32_t txtId = 0, txtFrom = 0; static volatile int txtCh = -1;
 // Kolejka wiadomosci LoRa (odpowiedzi, raporty): wysyla rdzen 1, najwczesniejsza pierwsza, min. 5 s odstepu
 struct LoraMsg { char txt[201]; uint32_t at, born; bool needName; };
 struct Sha256 { uint32_t h[8]; uint8_t buf[64]; uint64_t len; size_t n; };   // podpis mtnod.txt (u gory - prototypy Arduino)
+// POWMAN_TIME: "0" = bez timera (tylko pin), "12" = co 12 h (1-168), "6,18" = o tych godzinach (0-23, max 6;
+// jedna godzina z przecinkiem, np. "6,"), "5m" = co 5 minut (1-1440, do testow)
+static bool pmTimeOk(const String& t) {
+  if (t == "0") return true;
+  if (!t.length() || t.length() > 20) return false;
+  if (t.endsWith("m")) { String n = t.substring(0, t.length() - 1); for (char c : n) if (!isdigit(c)) return false;
+                         return n.length() && n.toInt() >= 1 && n.toInt() <= 1440; }
+  if (t.indexOf(',') < 0) { for (char c : t) if (!isdigit(c)) return false; return t.toInt() >= 1 && t.toInt() <= 168; }
+  int cnt = 0, i = 0;
+  while (i < (int)t.length()) {
+    int j = t.indexOf(',', i); if (j < 0) j = t.length();
+    String h = t.substring(i, j);
+    if (h.length()) { for (char c : h) if (!isdigit(c)) return false; if (h.toInt() > 23) return false; cnt++; }
+    i = j + 1;
+  }
+  return cnt >= 1 && cnt <= 6;
+}
 static bool gpioOk(int p) { return p == -1 || (p >= 0 && p <= 22) || (p >= 26 && p <= 28); }   // GP23-25, 29: modul Wi-Fi
 static LoraMsg loraQ[8]; static volatile uint8_t loraQn = 0;
 auto_init_mutex(loraQMtx);
@@ -136,17 +156,43 @@ static const uint8_t API_DISC[] = { 0x94, 0xC3, 0x00, 0x02, 0x20, 0x01 };   // T
 static const uint8_t API_WANTCFG[] = { 0x94, 0xC3, 0x00, 0x03, 0x18, 0xB9, 0x60 };   // want_config_id = 12345
 static volatile bool     apiMode = false;
 static volatile uint32_t apiNodeNum = 0;    // z my_info (FromRadio)
+static volatile int8_t chPskLen[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };   // dlugosc klucza kanalow wezla (-1 = nieznana)
 static volatile bool     apiConfigDone = false;
 static volatile uint32_t apiFrames = 0;
 static volatile uint32_t logNodeNum = 0;    // z linii logu "Use nodenum 0x..."
 static volatile uint32_t lastRxMs = 0;
 static volatile uint32_t lastApiUse = 0;           // ostatnie polaczenie API z wezlem
+static uint32_t pmApiAgoBoot = 0xFFFFFFFFUL;          // POWMAN: sekundy od ostatniego kontaktu API w chwili pobudki
+// Sekundy od ostatniego kontaktu API z wezlem (takze sprzed snu POWMAN); 0xFFFFFFFF = nieznane
+uint32_t apiAgoSec() {
+  if (lastApiUse) return (millis() - lastApiUse) / 1000;
+  if (pmApiAgoBoot != 0xFFFFFFFFUL) return pmApiAgoBoot + millis() / 1000;
+  return 0xFFFFFFFFUL;
+}
+// ---- POWMAN (gleboki sen Pico) ----
+#define PM_FLAG_PATH "/powman.on"                     // tryb POWMAN wlaczony (przezywa zanik zasilania)
+static bool pmOn = false;                               // tryb POWMAN wlaczony (plik PM_FLAG_PATH)
+static uint32_t pmDeadline = 0;                         // koniec czuwania (millis), 0 = brak
+static uint32_t pmSleepAt = 0;
+static bool pmBtnUsed = false;                          // BOOTSEL wylaczyl POWMAN - puszczenie bez restartu wezla
+#define PM_WAKE_PIN  14                               // wejscie wybudzenia (z GPIO wezla, 4,7 kOhm do GND)
+#define PM_MAGIC     0x504D                           // znacznik w rejestrze scratch POWMAN (16 bitow)
+static volatile bool pmPark = false, core1Parked = false;    // rdzen 1 ma sie zatrzymac przed snem
+static volatile bool pmCheckReq = false, pmCheckDone = false; // sprawdzenie wezla przed snem (rdzen 1)
+static bool pmWoke = false, pmByPin = false, pmByTimer = false;
+static uint32_t pmSleptMs = 0, pmPlanSec = 0, pmCycle = 0;
+static uint32_t pmDiagRst = 0, pmDiagWhy = 0, pmDiagScr = 0;   // diagnostyka pobudki
+#define PM_STATE_PATH "/powman.st"                     // dane snu (czas, plan, cykl) - zapas dla scratch POWMAN
 static volatile bool     fsReady = false;
 const char* CFG_PENDING_PATH = "/cfg.pending";     // konfiguracja do wyslania po restarcie Pico
 static const uint32_t CFG_BOOT_WAIT_MS = 60000;    // pierwszy start wezla: klucze, zapis plikow, GPS, BT
 static const uint32_t CFG_RETRY_WAIT_MS = 30000;   // przed ponowieniem konfiguracji
 static const uint32_t ACK_TIMEOUT_MS = 8000;       // np. zmiana regionu LoRa przestawia radio - trwa
-#define PICO_VER "0.27"
+#define PICO_VER "0.28"
+#include "skrypt_py.h"                               // wyslij_firmware.py do pobrania ze strony
+constexpr bool verEq(const char* a, const char* b) { return *a == *b && (*a == 0 || verEq(a + 1, b + 1)); }
+static_assert(verEq(SKRYPT_PY_WERSJA, PICO_VER),
+              "skrypt_py.h ma inna wersje niz program Pico - uzyj skrypt_py.h z tej samej wersji co .ino");
 const char PICO_VER_TAG[] = "PICOVER=" PICO_VER;    // znacznik w pliku .bin - skrypt odczytuje z niego wersje
 const char* PICO_VERSION = PICO_VER_TAG + 8;
 static volatile uint32_t picoRebootAt = 0;         // zaplanowany restart Pico (przycisk / skrypt)
@@ -177,6 +223,7 @@ static size_t logHead = 0;
 static bool   logWrapped = false;
 static volatile bool     heltecMounted = false;
 static volatile uint32_t totalBytes = 0;
+static volatile uint32_t nodeLines = 0;          // linie logu wezla (tekst i log_record) - do wykrywania ciszy
 auto_init_mutex(logMtx);
 
 static volatile uint32_t logTotal = 0;      // ile bajtow trafilo do logu od startu (do przyrostowego podgladu)
@@ -227,8 +274,9 @@ void logText(const char* s) {
   mutex_exit(&logMtx);
 }
 void logf(const char* fmt, ...) {
-  char m[192];
-  va_list ap; va_start(ap, fmt); vsnprintf(m, sizeof(m), fmt, ap); va_end(ap);
+  char m[320];
+  va_list ap; va_start(ap, fmt); int n = vsnprintf(m, sizeof(m), fmt, ap); va_end(ap);
+  if (n >= (int)sizeof(m) && fmt[strlen(fmt) - 1] == '\n') { m[sizeof(m) - 2] = '\n'; m[sizeof(m) - 1] = 0; }   // obciete - zachowaj koniec linii
   logText(m);
 }
 void fwSet(int pct, const char* fmt, ...) {
@@ -303,15 +351,19 @@ bool hcd_port_connect_status(uint8_t rhport);
 // Czy na linii USB jest fizycznie urzadzenie (podciagniete D+/D-), niezaleznie od logow i enumeracji.
 // Rejestr SIE_STATUS.SPEED w trybie host: 0 = brak urzadzenia, 1 = LS, 2 = FS.
 bool usbDevicePresent() { return (usb_hw->sie_status & USB_SIE_STATUS_SPEED_BITS) != 0; }
+bool restartUsbHost(bool force = false);
+static bool picoUpdBoot = false;                        // start zaraz po aktualizacji programu Pico
+#define USBFIX_PATH "/usbfix.once"
+#define NODE_RST_PATH "/node_rst.pend"                 // po aktualizacji Pico: reset wezla jeszcze nie zrobiony
 
 // Restart hosta USB tylko gdy jest urzadzenie: wielokrotne restarty przy pustej linii zawieszaly
 // TinyUSB (rdzen 1 stawal, watchdog restartowal Pico) - sprawdzone w testach 0.26.
-bool restartUsbHost() {
-  if (!usbDevicePresent()) {
+bool restartUsbHost(bool force) {
+  if (!usbDevicePresent() && !force) {
     logText("[PICO] Brak urzadzenia na linii USB - restart hosta pominiety\n");
     return false;
   }
-  logText("\n[PICO] Restart hosta USB...\n");
+  logText(force && !usbDevicePresent() ? "\n[PICO] Restart hosta USB (wymuszony przyciskiem, linia pusta)...\n" : "\n[PICO] Restart hosta USB...\n");
   crumb(CR_USB_DEINIT);
   tuh_deinit(0);
   cdcIdx = 0xFF; heltecMounted = false;
@@ -559,7 +611,7 @@ void apiFrame(const uint8_t* d, uint16_t n) {
   while (p < e) {
     uint64_t tag; if (!pbVarint(p, e, tag)) return;
     uint32_t fld = tag >> 3; uint8_t wt = tag & 7;
-    if (wt == 2 && (fld == 2 || fld == 3 || fld == 4 || fld == 6 || fld == 13 || fld == 16)) {
+    if (wt == 2 && (fld == 2 || fld == 3 || fld == 4 || fld == 6 || fld == 10 || fld == 13 || fld == 16)) {
       uint64_t L; if (!pbVarint(p, e, L) || L > (uint64_t)(e - p)) return;
       const uint8_t *q = p, *qe = p + L; p += L;
       if (fld == 2) {                                   // packet: potwierdzenia (ROUTING_APP) i wiadomosci tekstowe
@@ -600,7 +652,7 @@ void apiFrame(const uint8_t* d, uint16_t n) {
             }
             if (port == 5 && req) { ackErr = err; ackId = req; }
             // Wiadomosc tekstowa przekazana przez wezel (gdy Pico jest klientem API) -> komenda
-            if (port == 1 && txt && txtLen && pFrom && (int)pCh == cfg.ch) {
+            if (port == 1 && txt && txtLen && pFrom && (int)pCh == cfg.ch && chSecure(true)) {
               char m[201]; size_t k = 0;
               for (; k < txtLen && k < sizeof(m) - 1 && txt[k] != '\r' && txt[k] != '\n'; k++) m[k] = txt[k];
               m[k] = 0;
@@ -616,6 +668,25 @@ void apiFrame(const uint8_t* d, uint16_t n) {
           if ((t2 >> 3) == 1 && (t2 & 7) == 0) { uint64_t v; if (pbVarint(q, qe, v)) apiNodeNum = (uint32_t)v; break; }
           if (!pbSkip(q, qe, t2 & 7)) break;
         }
+      } else if (fld == 10) {                                  // channel: indeks i dlugosc klucza (PSK) - bez zapisu klucza
+        uint64_t idx = 0; int pskLen = 0; bool rola = false; uint64_t role = 0;
+        while (q < qe) {
+          uint64_t t2; if (!pbVarint(q, qe, t2)) break;
+          if ((t2 >> 3) == 1 && (t2 & 7) == 0) { if (!pbVarint(q, qe, idx)) break; continue; }
+          if ((t2 >> 3) == 3 && (t2 & 7) == 0) { if (!pbVarint(q, qe, role)) break; rola = true; continue; }
+          if ((t2 >> 3) == 2 && (t2 & 7) == 2) {
+            uint64_t L2; if (!pbVarint(q, qe, L2) || L2 > (uint64_t)(qe - q)) break;
+            const uint8_t *s2 = q, *se = q + L2; q += L2;
+            while (s2 < se) {
+              uint64_t t3; if (!pbVarint(s2, se, t3)) break;
+              if ((t3 >> 3) == 2 && (t3 & 7) == 2) { uint64_t L3; if (!pbVarint(s2, se, L3) || L3 > (uint64_t)(se - s2)) break; pskLen = (int)L3; s2 += L3; continue; }
+              if (!pbSkip(s2, se, t3 & 7)) break;
+            }
+            continue;
+          }
+          if (!pbSkip(q, qe, t2 & 7)) break;
+        }
+        if (idx < 8) chPskLen[idx] = (rola && role == 0) ? 0 : (int8_t)pskLen;   // kanal wylaczony = brak klucza
       } else if (fld == 13) {                                  // metadata: wersja firmware wezla
         pbStr(q, qe, 1, nodeFw, sizeof(nodeFw));
       } else if (fld == 4) {                                   // node_info: nazwa wlasnego wezla
@@ -630,16 +701,31 @@ void apiFrame(const uint8_t* d, uint16_t n) {
           if (!pbSkip(q, qe, t2 & 7)) break;
         }
         if (u && num && (uint32_t)num == apiNodeNum) { pbStr(u, ue, 2, nodeLong, sizeof(nodeLong)); pbStr(u, ue, 3, nodeShort, sizeof(nodeShort)); }
-      } else if (fld == 6) {                                   // log_record.message -> jak zwykly log tekstowy
+      } else if (fld == 6) {                                   // log_record -> linia jak w zwyklym logu tekstowym
+        const uint8_t* msg = nullptr; uint32_t mlen = 0, tsec = 0, lvl = 0; char src[24] = "";
         while (q < qe) {
           uint64_t t2; if (!pbVarint(q, qe, t2)) break;
-          if ((t2 >> 3) == 1 && (t2 & 7) == 2) {
-            uint64_t L2; if (!pbVarint(q, qe, L2) || L2 > (uint64_t)(qe - q)) break;
-            heltecText(q, (int)L2);
-            static const uint8_t nl = '\n'; heltecText(&nl, 1);
-            break;
-          }
-          if (!pbSkip(q, qe, t2 & 7)) break;
+          uint32_t f2 = t2 >> 3, w2 = t2 & 7;
+          if (f2 == 1 && w2 == 2) { uint64_t L2; if (!pbVarint(q, qe, L2) || L2 > (uint64_t)(qe - q)) break; msg = q; mlen = L2; q += L2; }
+          else if (f2 == 2 && w2 == 5 && qe - q >= 4) { tsec = q[0] | (q[1] << 8) | (q[2] << 16) | ((uint32_t)q[3] << 24); q += 4; }
+          else if (f2 == 4 && w2 == 0) { uint64_t v; if (!pbVarint(q, qe, v)) break; lvl = v; }
+          else if (f2 == 3 && w2 == 2) { uint64_t L2; if (!pbVarint(q, qe, L2) || L2 > (uint64_t)(qe - q)) break;
+                                         uint32_t k = L2 < sizeof(src) - 1 ? L2 : sizeof(src) - 1; memcpy(src, q, k); src[k] = 0; q += L2; }
+          else if (!pbSkip(q, qe, w2)) break;
+        }
+        // szum po kazdym polaczeniu API (odtwarzanie kolejki pakietow dla klienta) - pomijamy
+        static const char* const SZUM[] = { "replay packet to phone", "phone downloaded packet", "Tell client new packets" };
+        bool szum = false;
+        for (auto z : SZUM) { size_t zl = strlen(z); if (msg && mlen >= zl && !memcmp(msg, z, zl)) szum = true; }
+        if (msg && !szum) {
+          const char* lv = lvl >= 50 ? "CRIT " : lvl >= 40 ? "ERROR" : lvl >= 30 ? "WARN " : lvl >= 20 ? "INFO " : lvl >= 10 ? "DEBUG" : lvl ? "TRACE" : "";
+          char pre[64]; int pl;
+          if (tsec > 1700000000UL) { time_t tt = tsec; struct tm tmv; gmtime_r(&tt, &tmv);   // wezel podaje juz czas lokalny
+            pl = snprintf(pre, sizeof(pre), "%s | %02d:%02d:%02d [%s] ", lv, tmv.tm_hour, tmv.tm_min, tmv.tm_sec, src); }
+          else pl = snprintf(pre, sizeof(pre), "%s | [%s] ", lv, src);
+          if (pl > 0) heltecText((const uint8_t*)pre, pl < (int)sizeof(pre) ? pl : (int)sizeof(pre) - 1);
+          heltecText(msg, (int)mlen);
+          if (!mlen || msg[mlen - 1] != '\n') { static const uint8_t nl = '\n'; heltecText(&nl, 1); }
         }
       }
       else pbLogString(q, qe, 4, "[WEZEL] ");                     // client_notification.message
@@ -690,11 +776,29 @@ void noteNodeInfo(bool fw, bool cfg, bool erased) {
   if (f) { if (fwPart.length()) f.println(fwPart); if (otaPart.length()) f.println(otaPart); if (cfgPart.length()) f.println(cfgPart); f.close(); }
 }
 
+// Kanal komend musi byc prywatny z kluczem 256-bit (32 bajty). Publiczny / domyslny / krotki klucz = komendy
+// ignorowane i nic nie jest wysylane (kazdy w zasiegu moglby sterowac Pico i czytac odpowiedzi).
+bool chSecure(bool przyKomendzie) {
+  static int8_t last = -2;
+  int ch = cfg.ch; int8_t k = (ch >= 0 && ch < 8) ? chPskLen[ch] : -1;
+  bool ok = (k == 32);
+  if (k != last) {
+    last = k;
+    if (ok) logf("[PICO] Kanal komend %d: prywatny, klucz 256-bit - OK\n", ch);
+    else logf("[PICO] *** Kanal komend %d NIE jest bezpieczny (%s) - komendy LoRa ignorowane, raporty LoRa wylaczone. Ustaw kanal prywatny z kluczem 256-bit ***\n",
+              ch, k < 0 ? "brak informacji z wezla" : k == 0 ? "kanal wylaczony albo bez szyfrowania" :
+                  k == 1 ? "klucz domyslny/prosty (kanal publiczny)" : k == 16 ? "klucz tylko 128-bit" : "nietypowy klucz");
+  }
+  if (!ok && przyKomendzie) logText("[PICO] Komenda LoRa odrzucona - kanal komend nie jest prywatny z kluczem 256-bit\n");
+  return ok;
+}
+
 // Wyslanie wiadomosci tekstowej na kanal (broadcast) przez API wezla
 static size_t putVar(uint8_t* b, uint32_t v) { size_t n = 0; while (v >= 0x80) { b[n++] = (v & 0x7F) | 0x80; v >>= 7; } b[n++] = v; return n; }
 bool apiSendText(int ch, const char* text, bool connected = false) {
   if (cdcIdx == 0xFF || fwState == 1) return false;
   if (!connected && !apiConnect()) { apiMode = false; logText("[PICO] Odpowiedz LoRa: wezel nie odpowiada\n"); return false; }
+  if (ch != cfg.ch || !chSecure(false)) { apiMode = false; logText("[PICO] Wiadomosc LoRa NIE wyslana - kanal nie jest prywatny z kluczem 256-bit\n"); return false; }
   uint8_t data[220], pkt[240], tr[250], fr[260];
   size_t tl = strlen(text); if (tl > 200) tl = 200;
   size_t d = 0; data[d++] = 0x08; data[d++] = 0x01; data[d++] = 0x12; d += putVar(data + d, tl); memcpy(data + d, text, tl); d += tl;
@@ -1195,6 +1299,9 @@ TRWA ODBIOR PAKIETU FIRMWARE - strona nie odpytuje Pico, zeby nie przeszkadzac. 
  <tr><td>Dozwoleni nadawcy</td><td><input id="sSnd" placeholder="np. ed819a48,0c838131 (puste = wszyscy)" style="width:260px"></td></tr>
  <tr><td>Adres pliku mtnod.txt</td><td><input id="sUrl" placeholder="https:&#47;&#47;serwer/komin/mtnod.txt (puste = brak)" style="width:260px"></td></tr>
  <tr><td>Brak odpowiedzi wezla (min)</td><td><input id="sOdp" type="number" min="0" max="1440" style="width:70px"> <span style="color:#aaa">(0 = wylaczone, 5-1440)</span></td></tr>
+ <tr><td>POWMAN pobudka</td><td><input id="sPmT" style="width:90px"> <span style="color:#aaa">(0 = bez timera, 12 = co 12 h, 6,18 = o godzinach, 5m = test)</span></td></tr>
+ <tr><td>POWMAN czuwanie (min)</td><td><input id="sPmC" type="number" min="1" max="240" style="width:60px">
+   <span id="pmSt" style="color:#aaa"></span> <button onclick="act('Wylaczyc tryb POWMAN (Pico zostanie wlaczone na stale)?','/pm_off')">Wylacz POWMAN</button></td></tr>
  <tr><td>Pin resetu wezla (GP)</td><td><input id="sRp" type="number" min="-1" max="28" style="width:50px">
    <select id="sRh"><option value="1">aktywny stan wysoki</option><option value="0">aktywny stan niski</option></select>
    impuls <input id="sRs" type="number" min="1" max="60" style="width:45px"> s <span style="color:#aaa">(-1 = brak)</span></td></tr>
@@ -1203,6 +1310,9 @@ TRWA ODBIOR PAKIETU FIRMWARE - strona nie odpytuje Pico, zeby nie przeszkadzac. 
  Domyslne: WLACZ_PICO, USPIJ_PICO, WLACZ_TRYB_AP, WYLACZ_TRYB_AP, TEMP_PICO. Pico odpowiada na kanale krotka wiadomoscia.</p>
  <p style="color:#aaa;font-size:12px">Brak odpowiedzi wezla: gdy przez tyle minut z USB nie przyjda zadne dane, Pico pyta wezel przez API. Jesli nie odpowie:
  restart hosta USB, potem reset RTS, na koncu impuls na pinie resetu (max 3 na dobe). Pin steruje zewnetrznym ukladem (np. tranzystor odcinajacy zasilanie wezla).</p>
+ <p style="color:#aaa;font-size:12px">POWMAN (gleboki sen Pico, ok. 0,3-1 mA): wlaczasz komenda LoRa USPIJ_POWMAN, potem USPIJ_POWMAN:TAK. Pico budzi sie timerem
+ (POWMAN pobudka) na czas czuwania (Wi-Fi i LoRa dzialaja, sprawdza wezel, potem znow spi) albo stanem wysokim na GP14 (wtedy tryb sie wylacza).
+ Wylaczenie: WLACZ_PICO w czasie czuwania, przycisk obok, BOOTSEL gdy Pico nie spi. Tryb przetrwa zanik zasilania.</p>
  <button onclick="zapiszUst()" style="padding:6px 14px">Zapisz i zrestartuj Pico</button>
  <button onclick="act('Przywrocic WSZYSTKIE ustawienia domyslne (AP, hasla, kanal) i zrestartowac Pico?','/settings_reset')" style="padding:6px 14px;background:#a33;color:#fff">Ustawienia domyslne</button>
  <p style="color:#aaa;font-size:12px">W trybie STA, gdy Pico nie polaczy sie z siecia w 30 s, uruchomi AP. Krotkie nacisniecie BOOTSEL restartuje wezel; przytrzymanie 30 s przywraca ustawienia domyslne Pico.</p>
@@ -1222,6 +1332,7 @@ TRWA ODBIOR PAKIETU FIRMWARE - strona nie odpytuje Pico, zeby nie przeszkadzac. 
 <a id="dl1" href="#" style="padding:6px 14px;background:#0a0;color:#fff;text-decoration:none;border-radius:3px;font-size:13px;font-family:sans-serif">Pobierz log (.txt)</a>
 <a id="dl3" href="#" style="padding:6px 14px;background:#555;color:#fff;text-decoration:none;border-radius:3px;font-size:13px;font-family:sans-serif">Pobierz logi z flash (.txt)</a>
 <a id="dl2" href="#" style="padding:6px 14px;background:#06a;color:#fff;text-decoration:none;border-radius:3px;font-size:13px;font-family:sans-serif">Pobierz zdarzenia Pico (.txt)</a>
+<a id="dl4" href="#" style="padding:6px 14px;background:#748;color:#fff;text-decoration:none;border-radius:3px;font-size:13px;font-family:sans-serif">Pobierz skrypt wyslij_firmware.py</a>
 </div>
 <p>
 <button id="bp" onclick="tg('p')" style="padding:6px 14px">Zdarzenia Pico: START</button>
@@ -1285,7 +1396,8 @@ async function zaloguj(){
 function logout(){ TOK=''; try{ sessionStorage.removeItem('tok'); }catch(e){} location.reload(); }
 function linki(){ document.getElementById('dl1').href='/download?t='+encodeURIComponent(TOK);
   document.getElementById('dl2').href='/download_pico?t='+encodeURIComponent(TOK);
-  document.getElementById('dl3').href='/download_flash?t='+encodeURIComponent(TOK); rstLabel(); }
+  document.getElementById('dl3').href='/download_flash?t='+encodeURIComponent(TOK);
+  document.getElementById('dl4').href='/download_script?t='+encodeURIComponent(TOK); rstLabel(); }
 async function act(pytanie, url){
   if(!confirm(pytanie)) return;
   try{
@@ -1326,6 +1438,8 @@ async function togSet(){
   document.getElementById('sCh').value=v.ch||'1'; document.getElementById('sSnd').value=v.senders||''; document.getElementById('sUrl').value=v.url||'';
   document.getElementById('sOdp').value=v.brak_odp||'0'; document.getElementById('sRp').value=v.rst_pin||'-1';
   document.getElementById('sRs').value=v.rst_sek||'5'; document.getElementById('sRh').value=v.rst_hi||'1';
+  document.getElementById('sPmT').value=v.pm_time||'0'; document.getElementById('sPmC').value=v.pm_czuw||'30';
+  document.getElementById('pmSt').textContent=v.pm_on=='1'?'tryb POWMAN: WLACZONY':'tryb POWMAN: wylaczony';
   rstLabel();
   ['cmd_on','cmd_sleep','cmd_ap_on','cmd_ap_off','cmd_temp'].forEach((k,i)=>document.getElementById('c'+i).value=v[k]||'');
   ['sApP','sStP','sTok'].forEach(id=>document.getElementById(id).value='');
@@ -1334,7 +1448,7 @@ async function zapiszUst(){
   const g=id=>document.getElementById(id).value;
   const sta=document.getElementById('mSTA').checked?'1':'0';
   if(!confirm('Zapisac ustawienia i zrestartowac Pico?'+(sta=='1'?'\nPico przejdzie w tryb STA - strona bedzie pod innym adresem.':''))) return;
-  const b=new URLSearchParams({ap_ssid:g('sApS'),ap_pass:g('sApP'),token:g('sTok'),sta:sta,sta_ssid:g('sStS'),sta_pass:g('sStP'),ch:g('sCh'),senders:g('sSnd'),url:g('sUrl'),brak_odp:g('sOdp'),rst_pin:g('sRp'),rst_sek:g('sRs'),rst_hi:g('sRh'),
+  const b=new URLSearchParams({ap_ssid:g('sApS'),ap_pass:g('sApP'),token:g('sTok'),sta:sta,sta_ssid:g('sStS'),sta_pass:g('sStP'),ch:g('sCh'),senders:g('sSnd'),url:g('sUrl'),brak_odp:g('sOdp'),rst_pin:g('sRp'),rst_sek:g('sRs'),rst_hi:g('sRh'),pm_time:g('sPmT'),pm_czuw:g('sPmC'),
     cmd_on:g('c0'),cmd_sleep:g('c1'),cmd_ap_on:g('c2'),cmd_ap_off:g('c3'),cmd_temp:g('c4')});
   const r=await F('/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});
   const txt=await r.text(); alert(txt);
@@ -1656,6 +1770,29 @@ void handleInfo() {
   server.send(200, "text/plain", "PAKIET NA PICO:\n" + pkg + "\n\nOSTATNIO WGRANE DO WEZLA:\n" + (node.length() ? node : String("brak danych")));
 }
 
+// Czy plik to program tego projektu: w .bin musi byc znacznik "PICOVER=" (PICO_VER_TAG, od 0.23).
+// Chroni przed wgraniem przez pomylke innego programu (Pico stracilby Wi-Fi i strone).
+bool picoBinOk(const char* path) {
+  static const char TAG[] = "PICOVER=";
+  const size_t TL = sizeof(TAG) - 1;
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  uint8_t b[512 + 16]; size_t keep = 0, n; bool ok = false;
+  if (f.read(b, 4) == 4 && memcmp(b, "UF2\n", 4) == 0) {        // plik .uf2 (format dla BOOTSEL), nie .bin - wgrany zepsulby Pico
+    f.close(); logText("[PICO] Plik aktualizacji to .uf2 - potrzebny .bin\n"); return false;
+  }
+  f.seek(0);
+  while (!ok && (n = f.read(b + keep, 512)) > 0) {
+    size_t tot = keep + n;
+    for (size_t i = 0; i + TL <= tot; i++) if (memcmp(b + i, TAG, TL) == 0) { ok = true; break; }
+    keep = tot < TL - 1 ? tot : TL - 1;
+    memmove(b, b + tot - keep, keep);
+    rp2040.wdt_reset();
+  }
+  f.close();
+  return ok;
+}
+
 void handleFwEnd() {
   rp2040.wdt_reset();
   if (!tokenOk() || !upActive) { server.send(401, "text/plain", "Brak autoryzacji albo brak /fw_begin"); return; }
@@ -1670,6 +1807,12 @@ void handleFwEnd() {
     LittleFS.remove(upPath);
     logf("[PICO] Kontrola calego pakietu NIEZGODNA (odczytano %u B) - usuniety\n", (unsigned)tot);
     server.send(400, "text/plain", "CRC calego pakietu niezgodne - pakiet usuniety");
+    return;
+  }
+  if (upPath == PICO_BIN && !picoBinOk(PICO_BIN)) {
+    LittleFS.remove(PICO_BIN);
+    logText("[PICO] Odrzucono plik aktualizacji Pico - to nie jest program Pico2W flasher (brak znacznika PICOVER)\n");
+    server.send(400, "text/plain", "To nie jest program Pico2W flasher (brak znacznika wersji) - odrzucony, Pico zostaje przy obecnym programie");
     return;
   }
   if (upPath == PICO_BIN) {                          // aktualizacja Pico: zlec wgranie i restart
@@ -1725,6 +1868,7 @@ void loadSettings() {
   cfg.apSsid = DEF_AP_SSID; cfg.apPass = DEF_AP_PASS; cfg.token = DEF_TOKEN;
   cfg.staSsid = ""; cfg.staPass = ""; cfg.sta = false; cfg.ch = 1; cfg.senders = ""; cfg.url = ""; cfg.logOn = true;
   cfg.brakOdp = 0; cfg.rstPin = 15; cfg.rstSek = 5; cfg.rstHigh = true;
+  cfg.pmTime = "0"; cfg.pmCzuw = 30;
   for (int i = 0; i < 5; i++) cfg.cmd[i] = CMD_DEF[i];
   File f = LittleFS.open(SETTINGS_PATH, "r");
   if (!f) { logText("[PICO] Ustawienia: BRAK PLIKU - uzywam domyslnych\n"); return; }
@@ -1747,6 +1891,8 @@ void loadSettings() {
     else if (k == "rst_pin" && gpioOk(v.toInt())) cfg.rstPin = v.toInt();
     else if (k == "rst_sek") cfg.rstSek = constrain(v.toInt(), 1, 60);
     else if (k == "rst_hi") cfg.rstHigh = (v != "0");
+    else if (k == "pm_time" && pmTimeOk(v)) cfg.pmTime = v;
+    else if (k == "pm_czuw") cfg.pmCzuw = constrain(v.toInt(), 1, 240);
     else for (int i = 0; i < 5; i++) if (k == CMD_KEYS[i] && v.length()) cfg.cmd[i] = v;
   }
   f.close();
@@ -1759,6 +1905,7 @@ bool saveSettings() {
   for (int i = 0; i < 5; i++) f.printf("%s=%s\n", CMD_KEYS[i], cfg.cmd[i].c_str());
   f.printf("url=%s\n", cfg.url.c_str());
   f.printf("brak_odp=%d\nrst_pin=%d\nrst_sek=%d\nrst_hi=%d\n", cfg.brakOdp, cfg.rstPin, cfg.rstSek, cfg.rstHigh ? 1 : 0);
+  f.printf("pm_time=%s\npm_czuw=%d\n", cfg.pmTime.c_str(), cfg.pmCzuw);
   f.close(); return true;
 }
 void handleSettingsGet() {      // hasel nie odsylamy
@@ -1767,7 +1914,8 @@ void handleSettingsGet() {      // hasel nie odsylamy
               "\nsta_ssid=" + cfg.staSsid + "\nch=" + String(cfg.ch) + "\nsenders=" + cfg.senders + "\nurl=" + cfg.url + "\n" +
               CMD_KEYS[0] + "=" + cfg.cmd[0] + "\n" + CMD_KEYS[1] + "=" + cfg.cmd[1] + "\n" + CMD_KEYS[2] + "=" + cfg.cmd[2] +
               "\n" + CMD_KEYS[3] + "=" + cfg.cmd[3] + "\n" + CMD_KEYS[4] + "=" + cfg.cmd[4] + "\n" +
-              "brak_odp=" + cfg.brakOdp + "\nrst_pin=" + cfg.rstPin + "\nrst_sek=" + cfg.rstSek + "\nrst_hi=" + (cfg.rstHigh ? "1" : "0") + "\n");
+              "brak_odp=" + cfg.brakOdp + "\nrst_pin=" + cfg.rstPin + "\nrst_sek=" + cfg.rstSek + "\nrst_hi=" + (cfg.rstHigh ? "1" : "0") + "\n" +
+              "pm_time=" + cfg.pmTime + "\npm_czuw=" + cfg.pmCzuw + "\npm_on=" + (pmActive() ? "1" : "0") + "\n");
 }
 bool urlOk(const String& u) {
   return (u.startsWith("http://") || u.startsWith("https://")) && u.length() > 10 && u.length() <= 190 && u.indexOf(' ') < 0;
@@ -1788,6 +1936,8 @@ void handleSettingsPost() {
   if (server.hasArg("rst_pin"))  n.rstPin = server.arg("rst_pin").length() ? server.arg("rst_pin").toInt() : -1;
   if (server.hasArg("rst_sek"))  n.rstSek = server.arg("rst_sek").toInt();
   if (server.hasArg("rst_hi"))   n.rstHigh = server.arg("rst_hi") != "0";
+  if (server.hasArg("pm_time"))  { n.pmTime = server.arg("pm_time"); n.pmTime.trim(); n.pmTime.replace(" ", ""); if (!n.pmTime.length()) n.pmTime = "0"; }
+  if (server.hasArg("pm_czuw"))  n.pmCzuw = server.arg("pm_czuw").toInt();
   for (int i = 0; i < 5; i++)
     if (server.hasArg(CMD_KEYS[i]) && server.arg(CMD_KEYS[i]).length()) { n.cmd[i] = server.arg(CMD_KEYS[i]); n.cmd[i].trim(); n.cmd[i].toUpperCase(); }
   String err;
@@ -1801,12 +1951,15 @@ void handleSettingsPost() {
   else if (n.brakOdp != 0 && (n.brakOdp < 5 || n.brakOdp > 1440)) err = "Brak odpowiedzi wezla: 0 (wylaczone) albo 5-1440 min";
   else if (!gpioOk(n.rstPin)) err = "Pin resetu: -1 (brak), GP0-GP22 albo GP26-GP28";
   else if (n.rstSek < 1 || n.rstSek > 60) err = "Czas impulsu resetu: 1-60 s";
+  else if (!pmTimeOk(n.pmTime)) err = "POWMAN pobudka: 0, co ile godzin (1-168), godziny np. 6,18 albo test np. 5m";
+  else if (n.pmCzuw < 1 || n.pmCzuw > 240) err = "POWMAN czuwanie: 1-240 min";
   for (const String* v : { &n.apSsid, &n.apPass, &n.token, &n.staSsid, &n.staPass, &n.senders, &n.url })
     if (v->indexOf('\n') >= 0 || v->indexOf('=') == 0) err = "Niedozwolony znak";
   for (int i = 0; i < 5 && !err.length(); i++) {
     if (n.cmd[i].length() < 3 || n.cmd[i].length() > 20 || n.cmd[i].indexOf(' ') >= 0 ||
         n.cmd[i].indexOf(':') >= 0 || n.cmd[i].indexOf('=') >= 0) err = "Komenda: 3-20 znakow, bez spacji, ':' i '='";
-    if (n.cmd[i] == "HELP" || n.cmd[i] == "WERSJE" || n.cmd[i] == "AKTUALIZUJ_INTERNET") err = "Nazwy HELP, WERSJE i AKTUALIZUJ_INTERNET sa zarezerwowane";
+    if (n.cmd[i] == "HELP" || n.cmd[i] == "WERSJE" || n.cmd[i] == "AKTUALIZUJ_INTERNET" || n.cmd[i] == "USPIJ_POWMAN")
+      err = "Nazwy HELP, WERSJE, AKTUALIZUJ_INTERNET i USPIJ_POWMAN sa zarezerwowane";
     for (int j = 0; j < i; j++) if (n.cmd[i] == n.cmd[j]) err = "Komendy musza byc rozne";
   }
   if (err.length()) { server.send(400, "text/plain", err); return; }
@@ -1865,6 +2018,14 @@ void logFlashService() {
   if (millis() - flogLastMs > 3600000UL) flushLogToFlash("co godzine");
   else if (logTotal - flogSaved > 36 * 1024) flushLogToFlash("bufor RAM pelny");
 }
+void handleDownloadScript() {                       // skrypt z pamieci programu, w kawalkach
+  const size_t len = sizeof(SKRYPT_PY) - 1;
+  server.sendHeader("Content-Disposition", "attachment; filename=\"wyslij_firmware.py\"");
+  server.setContentLength(len);
+  server.send(200, "text/x-python; charset=utf-8", "");
+  for (size_t o = 0; o < len; o += 2048) { server.sendContent(SKRYPT_PY + o, len - o < 2048 ? len - o : 2048); rp2040.wdt_reset(); }
+  logText("[PICO] Pobrano skrypt wyslij_firmware.py " SKRYPT_PY_WERSJA "\n");
+}
 void handleDownloadFlash() {                        // strumieniowo: oba pliki naraz nie zmieszcza sie w RAM
   flushLogToFlash("pobranie");
   server.sendHeader("Content-Disposition", "attachment; filename=\"pico_log_flash.txt\"");
@@ -1888,6 +2049,7 @@ void checkBootselReset() {
   lastChk = millis();
   if (fwState == 1) { held = 0; return; }
   if (BOOTSEL) {
+    pmBootselOff();
     if (!held) { held = millis(); zgloszony = false; }
     else if (!zgloszony && millis() - held > 3000) { zgloszony = true; logText("[PICO] BOOTSEL trzymany - po 30 s ustawienia domyslne\n"); }
     if (millis() - held > 30000) {
@@ -1900,7 +2062,8 @@ void checkBootselReset() {
   } else if (held) {
     uint32_t d = millis() - held;
     held = 0;
-    if (d < 2000) { logText("[PICO] BOOTSEL krotko - restart wezla ESP32-S3\n"); reqCmd = 1; }
+    if (pmBtnUsed) pmBtnUsed = false;                      // nacisniecie wylaczylo POWMAN - bez restartu wezla
+    else if (d < 2000) { logText("[PICO] BOOTSEL krotko - restart wezla ESP32-S3\n"); reqCmd = 1; }
     else if (d < 30000) logText("[PICO] BOOTSEL puszczony przed 30 s - bez zmian\n");
   }
 }
@@ -1919,7 +2082,7 @@ void startWifi() {
     for (int s = 0; s < 3 && !widoczna; s++) {
       int n = WiFi.scanNetworks();
       for (int i = 0; i < n && !widoczna; i++) widoczna = (WiFi.SSID(i) == cfg.staSsid);
-      rp2040.wdt_reset();
+      rp2040.wdt_reset(); pmBootselOff();
       if (!widoczna) delay(500);
     }
     if (!widoczna) { logf("[PICO] Wi-Fi STA: sieci '%s' nie widac w skanie - krotka proba polaczenia\n", cfg.staSsid.c_str()); limit = 12000; }
@@ -1936,7 +2099,7 @@ void startWifi() {
       podejscie++;
       WiFi.begin(cfg.staSsid.c_str(), cfg.staPass.c_str());
       uint32_t t1 = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - t1 < 7000 && millis() - t0 < limit) { delay(200); rp2040.wdt_reset(); }
+      while (WiFi.status() != WL_CONNECTED && millis() - t1 < 7000 && millis() - t0 < limit) { delay(200); rp2040.wdt_reset(); pmBootselOff(); }
       if (WiFi.status() != WL_CONNECTED) {
         logf("[PICO] Wi-Fi STA: podejscie %d bez polaczenia (status %d) - ponawiam\n", podejscie, (int)WiFi.status());
         WiFi.disconnect(); delay(1000); rp2040.wdt_reset();
@@ -2009,6 +2172,12 @@ void wifiService() {
 String myIp() { return staActive ? WiFi.localIP().toString() : WiFi.softAPIP().toString(); }
 
 void setup() {
+  pmEarlyBoot();                  // POWMAN: czy to pobudka ze snu (przed wszystkim, co dotyka rejestrow POWMAN)
+  if (!LittleFS.begin()) { logText("[PICO] LittleFS nie dal sie zamontowac - FORMATOWANIE (ustawienia utracone)\n");
+                           LittleFS.format(); LittleFS.begin(); }
+  // Znacznik sprzetowy "switched core power-down" w chip_reset NIE kasuje sie przy zwyklym restarcie - po jednej pobudce
+  // kazdy kolejny restart (aktualizacja, przycisk) wygladalby jak pobudka. Pobudka = znacznik + plik stanu zapisany tuz przed snem.
+  if (pmWoke && !LittleFS.exists(PM_STATE_PATH)) { pmWoke = false; pmByPin = pmByTimer = false; }
   switch (rp2040.getResetReason()) {
     case RP2040::PWRON_RESET:    bootReason = "wlaczenie zasilania"; break;
     case RP2040::RUN_PIN_RESET:  bootReason = "pin RUN"; break;
@@ -2019,12 +2188,13 @@ void setup() {
     case RP2040::BROWNOUT_RESET: bootReason = "BROWNOUT (spadek napiecia!)"; break;
     default:                     bootReason = "nieznany"; break;
   }
+  if (pmWoke) bootReason = pmByPin ? "wybudzenie z POWMAN (pin GP14)" : pmByTimer ? "wybudzenie z POWMAN (timer)" : "wybudzenie z POWMAN";
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1); tzset();  // czas polski - takze dla czasu z sieci LoRa
   logf("[PICO] Wersja programu Pico: %s\n", PICO_VERSION);
   logf("[PICO] Przyczyna startu: %s\n", bootReason);
   bool naZadanie = rp2040.getResetReason() == RP2040::WDT_RESET && watchdog_hw->scratch[2] == PLANNED_MAGIC;
   watchdog_hw->scratch[2] = 0;
-  if (rp2040.getResetReason() == RP2040::WDT_RESET && !naZadanie) {
+  if (rp2040.getResetReason() == RP2040::WDT_RESET && !naZadanie && !pmWoke) {
     logText("[PICO] *** START PO RESTARCIE Z WATCHDOGA ***\n");
     if (watchdog_hw->scratch[1] == CRUMB_MAGIC) {
       uint32_t c = watchdog_hw->scratch[0] & 0xFF, x = watchdog_hw->scratch[0] >> 8;
@@ -2034,12 +2204,11 @@ void setup() {
     }
   }
   else logText("[PICO] Normalny start\n");
-  if (rp2040.getResetReason() == RP2040::PWRON_RESET || rp2040.getResetReason() == RP2040::BROWNOUT_RESET)
+  if (pmWoke) logText("[PICO] Start po glebokim snie POWMAN\n");
+  else if (rp2040.getResetReason() == RP2040::PWRON_RESET || rp2040.getResetReason() == RP2040::BROWNOUT_RESET)
     bootReportWanted = true;                                 // raport o wlaczeniu zasilania (bootReportService)
   crumb(CR_IDLE);
 
-  if (!LittleFS.begin()) { logText("[PICO] LittleFS nie dal sie zamontowac - FORMATOWANIE (ustawienia utracone)\n");
-                           LittleFS.format(); LittleFS.begin(); }
   if (LittleFS.exists("/reset.why")) { logf("[PICO] Ustawienia domyslne przywrocone wczesniej: %s\n", readFileStr("/reset.why").c_str());
                                        LittleFS.remove("/reset.why"); }
   if (LittleFS.exists(PICO_BIN)) {                   // po aktualizacji programu Pico: czysty LittleFS, ustawienia zostaja
@@ -2048,11 +2217,15 @@ void setup() {
     LittleFS.format(); LittleFS.begin();
     saveSettings();
     if (loraOld.length()) queueLora(String("PICO: zaktualizowane ") + loraOld + " -> " + PICO_VERSION + ", ustawienia zachowane", 120000);
-    resetNodeAfterUpdate = true;                     // wezel pamieta tryb API sprzed aktualizacji - reset = swiezy start i logi
+    resetNodeAfterUpdate = true; picoUpdBoot = true;
+    { File r = LittleFS.open(NODE_RST_PATH, "w"); if (r) { r.print("1"); r.close(); } }   // przetrwa restart Pico przed resetem wezla                     // wezel pamieta tryb API sprzed aktualizacji - reset = swiezy start i logi
     if (hist.length()) { File h = LittleFS.open(NODE_INFO_PATH, "w"); if (h) { h.print(hist); h.close(); } }
     logf("[PICO] Program Pico zaktualizowany do wersji %s - LittleFS sformatowany od nowa\n", PICO_VERSION);
   }
   fsReady = true;
+  if (LittleFS.exists(NODE_RST_PATH)) resetNodeAfterUpdate = true;   // reset wezla po aktualizacji Pico - obowiazkowy, do skutku
+  pmOn = LittleFS.exists(PM_FLAG_PATH);
+  pmLoadState();
   loadPkgMode();
   pinMode(LED_BUILTIN, OUTPUT);
 
@@ -2070,6 +2243,7 @@ void setup() {
   server.on("/download",      []() { if (needAuth()) handleDownload(); });
   server.on("/download_pico", []() { if (needAuth()) handleDownloadPico(); });
   server.on("/download_flash", []() { if (needAuth()) handleDownloadFlash(); });
+  server.on("/download_script", []() { if (needAuth()) handleDownloadScript(); });
   server.on("/settings",      HTTP_GET,  []() { if (needAuth()) handleSettingsGet(); });
   server.on("/settings",      HTTP_POST, []() { if (needAuth()) handleSettingsPost(); });
   // Akcje wymagaja hasla (X-Auth-Token) i nie dzialaja w trakcie flashowania
@@ -2082,6 +2256,10 @@ void setup() {
   server.on("/hreset",   HTTP_POST, [akcja]() { akcja(1, "Reset ESP32-S3 wykonany"); });
   server.on("/hboot",    HTTP_POST, [akcja]() { akcja(2, "ESP32-S3 przelaczony w bootloader"); });
   server.on("/chiptest", HTTP_POST, [akcja]() { akcja(5, "Test bootloadera uruchomiony - wynik w zdarzeniach Pico"); });
+  server.on("/pm_off", HTTP_POST, []() { if (!tokenOk()) { server.send(401, "text/plain", "Zle haslo"); return; }
+    bool byl = pmOn; pmSetFlag(false); pmSleepAt = pmDeadline = 0;
+    if (byl) logText("[POWMAN] Tryb POWMAN wylaczony ze strony\n");
+    server.send(200, "text/plain", byl ? "Tryb POWMAN wylaczony - Pico pracuje normalnie" : "Tryb POWMAN nie byl wlaczony"); });
   server.on("/rst_test", HTTP_POST, [akcja]() { if (cfg.rstPin < 0) { server.send(400, "text/plain", "Pin resetu wylaczony (-1) - ustaw go w ustawieniach"); return; }
     akcja(8, "Impuls na pinie resetu wyslany - opis w zdarzeniach Pico"); });
   server.on("/pkg_crc",  []() { if (!needAuth()) return;
@@ -2101,6 +2279,7 @@ void setup() {
                 "', haslo " + DEF_AP_PASS + ", adres http://192.168.4.1"); });
   server.on("/auth",     HTTP_POST, []() {
     bool ok = tokenOk();
+    if (ok) pmExtend();
     logf("[PICO] %s do strony z %s\n", ok ? "Logowanie" : "NIEUDANE logowanie", server.client().remoteIP().toString().c_str());
     server.send(ok ? 200 : 401, "text/plain", ok ? "OK" : "Zle haslo"); });
   server.on("/fw_begin", HTTP_POST, handleFwBegin);
@@ -2137,6 +2316,246 @@ void setup() {
   rp2040.wdt_begin(8000);
 }
 
+// =========================================================================
+// POWMAN - gleboki sen Pico (stan P1.7: rdzenie, SRAM i XIP bez zasilania). Wybudzenie = pelny start Pico.
+// Wzorowane na pico-sdk hardware_powman (BSD-3). Zrodla wybudzenia: timer AON (LPOSC) i poziom wysoki na GP14.
+// =========================================================================
+bool pmActive() { return pmOn; }
+static inline void pmW(volatile uint32_t* r, uint32_t v) { *r = POWMAN_PASSWORD_BITS | (v & 0xffff); }
+static inline void pmSet(volatile uint32_t* r, uint32_t b) { hw_set_bits(r, POWMAN_PASSWORD_BITS | b); }
+static inline void pmClr(volatile uint32_t* r, uint32_t b) { hw_clear_bits(r, POWMAN_PASSWORD_BITS | b); }
+static void pmScr(int i, uint32_t v16) { pmW(&powman_hw->scratch[i], v16 & 0xffff); }
+static uint32_t pmScrGet(int i) { return powman_hw->scratch[i] & 0xffff; }
+static uint64_t pmGetMs() {
+  uint32_t hi = powman_hw->read_time_upper, lo;
+  while (true) { lo = powman_hw->read_time_lower; uint32_t h2 = powman_hw->read_time_upper; if (h2 == hi) break; hi = h2; }
+  return ((uint64_t)hi << 32) | lo;
+}
+static void pmSetFlag(bool on) {
+  pmOn = on;
+  if (on) { File f = LittleFS.open(PM_FLAG_PATH, "w"); if (f) { f.print("1"); f.close(); } pmScr(7, 0); }
+  else LittleFS.remove(PM_FLAG_PATH);
+}
+// Pierwsza rzecz w setup(): czy to pobudka z POWMAN i czym; wylaczenie zrodel wybudzenia
+void pmEarlyBoot() {
+  pmDiagRst = powman_hw->chip_reset; pmDiagWhy = powman_hw->last_swcore_pwrup; pmDiagScr = powman_hw->scratch[0];
+  if (pmScrGet(0) == PM_MAGIC || (pmDiagRst & POWMAN_CHIP_RESET_HAD_SWCORE_PD_BITS)) {
+    pmWoke = true;
+    uint32_t why = powman_hw->last_swcore_pwrup;
+    pinMode(PM_WAKE_PIN, INPUT_PULLDOWN);
+    pmByTimer = why & 0x40;
+    pmByPin = (why & 0x1E) || (!pmByTimer && digitalRead(PM_WAKE_PIN));
+    if (pmScrGet(0) == PM_MAGIC) {
+    uint32_t t0 = pmScrGet(3) | (pmScrGet(4) << 16);
+    pmSleptMs = (uint32_t)pmGetMs() - t0;
+    pmPlanSec = pmScrGet(5) | (pmScrGet(6) << 16);
+    pmCycle = pmScrGet(7);
+    uint32_t unix0 = pmScrGet(1) | (pmScrGet(2) << 16);
+    if (unix0 > 1700000000UL) { struct timeval tv = { (time_t)(unix0 + pmSleptMs / 1000), 0 }; settimeofday(&tv, nullptr); }
+    }
+    pmScr(0, 0);
+  }
+  pmClr(&powman_hw->timer, POWMAN_TIMER_PWRUP_ON_ALARM_BITS | POWMAN_TIMER_ALARM_ENAB_BITS);
+  pmClr(&powman_hw->inte, POWMAN_INTE_TIMER_BITS);
+  pmClr(&powman_hw->pwrup[0], POWMAN_PWRUP0_ENABLE_BITS);
+}
+// BOOTSEL wcisniety przy wlaczonym trybie POWMAN (przed snem, w czuwaniu, przy laczeniu Wi-Fi) = tryb wylaczony
+bool pmBootselOff() {
+  if (!pmOn || !fsReady || !BOOTSEL) return false;
+  pmSetFlag(false); pmSleepAt = pmDeadline = 0; pmBtnUsed = true;
+  logText("[POWMAN] BOOTSEL - tryb POWMAN wylaczony, Pico pracuje normalnie\n");
+  return true;
+}
+// Po zamontowaniu LittleFS: dane snu z pliku (gdy scratch POWMAN nie przetrwal) + diagnostyka
+void pmLoadState() {
+  if (pmOn || pmWoke) logf("[POWMAN] diag: chip_reset=0x%08lx pwrup=0x%lx scratch0=0x%08lx\n",
+                          (unsigned long)pmDiagRst, (unsigned long)pmDiagWhy, (unsigned long)pmDiagScr);
+  if (pmOn && !pmWoke && (pmDiagRst & POWMAN_CHIP_RESET_HAD_RUN_LOW_BITS)) {      // reset przyciskiem/pinem RUN = czlowiek
+    pmSetFlag(false); logText("[POWMAN] Start z pinu RUN (przycisk) - tryb POWMAN wylaczony\n");
+  }
+  pmBootselOff();
+  if (!LittleFS.exists(PM_STATE_PATH)) return;
+  String st = readFileStr(PM_STATE_PATH); LittleFS.remove(PM_STATE_PATH);
+  unsigned long unix0 = 0, t0 = 0, plan = 0, cyk = 0, apiAgo = 0xFFFFFFFFUL;
+  int n = sscanf(st.c_str(), "%lu %lu %lu %lu %lu", &unix0, &t0, &plan, &cyk, &apiAgo);
+  if (!pmWoke || n < 4) return;
+  uint32_t spal = (uint32_t)pmGetMs() - (uint32_t)t0;
+  if (n == 5 && apiAgo != 0xFFFFFFFFUL) pmApiAgoBoot = apiAgo + spal / 1000;
+  if (pmCycle) return;                                          // dane snu juz ze scratch
+  pmSleptMs = spal; pmPlanSec = plan; pmCycle = cyk;
+  if (unix0 > 1700000000UL) { struct timeval tv = { (time_t)(unix0 + pmSleptMs / 1000), 0 }; settimeofday(&tv, nullptr); }
+}
+// Rzeczywista czestotliwosc LPOSC: timer liczy z LPOSC przy zalozeniu 32768 Hz, porownanie z micros() przez 2 s
+static void pmLposcHz(uint32_t hz) {
+  pmClr(&powman_hw->timer, POWMAN_TIMER_RUN_BITS);
+  pmW(&powman_hw->lposc_freq_khz_int, hz / 1000);
+  pmW(&powman_hw->lposc_freq_khz_frac, (hz % 1000) * 65536 / 1000);
+  pmSet(&powman_hw->timer, POWMAN_TIMER_USE_LPOSC_BITS);
+  pmSet(&powman_hw->timer, POWMAN_TIMER_RUN_BITS);
+  uint32_t t0 = millis(); while (!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) && millis() - t0 < 100) {}
+}
+static uint32_t pmMeasureLposc() {
+  pmLposcHz(32768);
+  uint64_t a = pmGetMs(); uint32_t u0 = micros();
+  while (micros() - u0 < 2000000UL) rp2040.wdt_reset();
+  uint64_t b = pmGetMs(); uint32_t u1 = micros();
+  uint32_t hz = (uint32_t)(32768.0 * (double)(b - a) * 1000.0 / (double)(u1 - u0) + 0.5);
+  if (hz < 25000 || hz > 40000) hz = 32768;
+  pmLposcHz(hz);
+  return hz;
+}
+// Ile sekund spac i opis nastepnej pobudki
+static uint32_t pmNextSleep(String& opis) {
+  String t = cfg.pmTime;
+  if (t == "0") { opis = "tylko pinem GP14"; return 0; }
+  if (t.endsWith("m")) { uint32_t m = t.toInt(); opis = String("za ") + m + " min (test)"; return m * 60; }
+  if (t.indexOf(',') < 0) { uint32_t h = t.toInt(); opis = String("za ") + h + " h"; return h * 3600; }
+  int godz[6], n = 0, i = 0;
+  while (i < (int)t.length() && n < 6) { int j = t.indexOf(',', i); if (j < 0) j = t.length();
+    String h = t.substring(i, j); if (h.length()) godz[n++] = h.toInt(); i = j + 1; }
+  time_t now = time(nullptr);
+  if (now < 1700000000) { uint32_t h = 24 / (n ? n : 1); opis = String("za ") + h + " h (brak godziny - odstep zastepczy)"; return h * 3600; }
+  uint32_t best = 0xFFFFFFFF;
+  for (int k = 0; k < n; k++) {
+    struct tm lt; localtime_r(&now, &lt); lt.tm_hour = godz[k]; lt.tm_min = 0; lt.tm_sec = 0;
+    time_t cel = mktime(&lt);
+    while (cel < now + 600) { lt.tm_mday++; cel = mktime(&lt); }
+    if ((uint32_t)(cel - now) < best) best = cel - now;
+  }
+  time_t cel = now + best; struct tm c; localtime_r(&cel, &c);
+  char b[40]; snprintf(b, sizeof(b), "ok. %02d:%02d", c.tm_hour, c.tm_min); opis = b;
+  return best;
+}
+// Zasypianie: zapis logu, kalibracja LPOSC, zatrzymanie rdzenia 1, Wi-Fi off, zrodla wybudzenia, stan P1.7
+bool pmGoSleep() {
+  if (pmBusy()) { logText("[POWMAN] Trwa operacja na firmware - nie zasypiam\n"); return false; }   // ostatnia kontrola
+  pinMode(PM_WAKE_PIN, INPUT_PULLDOWN); delay(5);
+  if (digitalRead(PM_WAKE_PIN)) {
+    logText("[POWMAN] GP14 w stanie wysokim - nie zasypiam (pin obudzilby Pico od razu). Ustaw pin wezla na 0.\n");
+    return false;
+  }
+  String opis; uint32_t sek = pmNextSleep(opis);
+  uint32_t hz = pmMeasureLposc();
+  pmCycle++;
+  logf("[POWMAN] Zasypiam (cykl %lu), pobudka %s; LPOSC %lu Hz; wybudzenie pinem GP14\n",
+       (unsigned long)pmCycle, opis.c_str(), (unsigned long)hz);
+  { uint64_t tf = pmGetMs(); uint32_t uf = time(nullptr) > 1700000000 ? (uint32_t)time(nullptr) : 0;
+    File f = LittleFS.open(PM_STATE_PATH, "w");
+    if (f) { f.printf("%lu %lu %lu %lu %lu", (unsigned long)uf, (unsigned long)(uint32_t)tf, (unsigned long)sek, (unsigned long)pmCycle,
+                     (unsigned long)apiAgoSec()); f.close(); } }
+  flushLogToFlash("POWMAN zasypiam");
+  hw_clear_bits(&watchdog_hw->ctrl, WATCHDOG_CTRL_ENABLE_BITS);   // watchdog wylaczony - rdzen 1 zaraz stanie
+  pmPark = true;
+  uint32_t t0 = millis(); while (!core1Parked && millis() - t0 < 3000) delay(1);
+  wifiOff();
+  gpio_init(23); gpio_set_dir(23, GPIO_OUT); gpio_put(23, 0); gpio_pull_down(23);   // CYW43 (Wi-Fi) bez zasilania
+  hw_set_bits(&usb_hw->main_ctrl, USB_MAIN_CTRL_PHY_ISO_BITS);
+  // dane dla nastepnego startu (scratch POWMAN przezywa sen, 16 bitow na rejestr)
+  uint64_t teraz = pmGetMs(); uint32_t unix0 = time(nullptr) > 1700000000 ? (uint32_t)time(nullptr) : 0;
+  pmScr(1, unix0); pmScr(2, unix0 >> 16); pmScr(3, (uint32_t)teraz); pmScr(4, (uint32_t)teraz >> 16);
+  pmScr(5, sek); pmScr(6, sek >> 16); pmScr(7, pmCycle); pmScr(0, PM_MAGIC);
+  for (int i = 0; i < 4; i++) powman_hw->boot[i] = 0;               // bez "wznowienia" - zawsze czysty start
+  pmSet(&powman_hw->dbg_pwrcfg, POWMAN_DBG_PWRCFG_IGNORE_BITS);
+  pmClr(&powman_hw->seq_cfg, POWMAN_SEQ_CFG_HW_PWRUP_SRAM0_BITS | POWMAN_SEQ_CFG_HW_PWRUP_SRAM1_BITS);
+  // wybudzenie pinem: poziom wysoki na GP14
+  gpio_set_input_enabled(PM_WAKE_PIN, true); gpio_pull_down(PM_WAKE_PIN);
+  pmW(&powman_hw->pwrup[0], (POWMAN_PWRUP0_MODE_VALUE_LEVEL << POWMAN_PWRUP0_MODE_LSB) | POWMAN_PWRUP0_DIRECTION_BITS |
+                            (PM_WAKE_PIN << POWMAN_PWRUP0_SOURCE_LSB));
+  pmClr(&powman_hw->pwrup[0], POWMAN_PWRUP0_STATUS_BITS);
+  pmSet(&powman_hw->pwrup[0], POWMAN_PWRUP0_ENABLE_BITS);
+  // wybudzenie timerem
+  if (sek) {
+    uint64_t al = pmGetMs() + (uint64_t)sek * 1000;
+    pmClr(&powman_hw->timer, POWMAN_TIMER_ALARM_ENAB_BITS);
+    pmW(&powman_hw->alarm_time_15to0, al); pmW(&powman_hw->alarm_time_31to16, al >> 16);
+    pmW(&powman_hw->alarm_time_47to32, al >> 32); pmW(&powman_hw->alarm_time_63to48, al >> 48);
+    pmSet(&powman_hw->timer, POWMAN_TIMER_ALARM_BITS);                // skasowanie starego alarmu (bit kasowany zapisem 1)
+    pmSet(&powman_hw->timer, POWMAN_TIMER_ALARM_ENAB_BITS | POWMAN_TIMER_PWRUP_ON_ALARM_BITS);
+  }
+  // zadanie stanu P1.7 (wszystkie przelaczane domeny wylaczone)
+  pmClr(&powman_hw->state, POWMAN_STATE_REQ_IGNORED_BITS);
+  pmW(&powman_hw->state, (0xFu << POWMAN_STATE_REQ_LSB) & POWMAN_STATE_REQ_BITS);
+  bool ok = !(powman_hw->state & (POWMAN_STATE_REQ_IGNORED_BITS | POWMAN_STATE_BAD_SW_REQ_BITS));
+  if (ok) { ok = false; for (int i = 0; i < 500; i++) if (powman_hw->state & POWMAN_STATE_WAITING_BITS) { ok = true; break; } }
+  if (!ok) { pmScr(0, 0); plannedReboot(); }                          // nie wyszlo - zwykly restart zamiast snu
+  noInterrupts();
+  while (true) __wfi();
+  return true;
+}
+// Rdzen 1: zatrzymanie przed snem (wolane z loop1)
+void pmCore1Park() {
+  tuh_deinit(0);
+  core1Parked = true;
+  noInterrupts();
+  while (true) __wfi();
+}
+// Rdzen 0: logika trybu POWMAN (wolane z loop)
+// Cokolwiek zwiazanego z firmware w toku = zakaz snu: flashowanie/konfiguracja wezla, przyjmowanie pakietu lub programu Pico,
+// zlecone wgranie z LoRa/internetu, pobieranie z internetu, zaplanowany restart Pico (aktualizacja), sekwencja RTS/bootloader.
+bool pmFwOp() {   // operacja na firmware (wylacza tryb POWMAN)
+  return fwState == 1 || upActive || pendingFlashAt || dlReq >= 0 || picoRebootAt;
+}
+bool pmBusy() {   // zakaz snu: operacja na firmware albo sekwencja RTS/bootloader (np. odzyskiwanie wezla)
+  return pmFwOp() || seq != nullptr;
+}
+
+void pmService() {
+  static bool startDone = false;
+  if (!startDone && millis() > 3000) {
+    startDone = true;
+    if (pmWoke) {
+      char b[160];
+      snprintf(b, sizeof(b), "[POWMAN] Wybudzenie %s po %lu min (plan %lu min), cykl %lu\n",
+               pmByPin ? "PINEM GP14" : pmByTimer ? "timerem" : "(przyczyna nieznana)",
+               (unsigned long)(pmSleptMs / 60000), (unsigned long)(pmPlanSec / 60), (unsigned long)pmCycle);
+      logText(b);
+    }
+    if (pmOn && pmWoke && pmByPin) {
+      pmSetFlag(false);
+      logText("[POWMAN] Wybudzenie pinem - tryb POWMAN wylaczony, Pico pracuje normalnie\n");
+      queueLora("PICO: wybudzone pinem GP14 - tryb POWMAN wylaczony", 120000);
+    } else if (pmOn && pmWoke) {
+      pmDeadline = millis() + (uint32_t)cfg.pmCzuw * 60000UL;
+      logf("[POWMAN] Czuwanie %d min (Wi-Fi i komendy LoRa dzialaja)\n", cfg.pmCzuw);
+    } else if (pmOn) {
+      logText("[POWMAN] Start Pico w trybie POWMAN (zasilanie/restart) - zasypiam za 30 s (BOOTSEL = anuluj)\n");
+      pmSleepAt = millis() + 30000;
+    }
+  }
+  if (!pmOn) { pmDeadline = pmSleepAt = 0; return; }
+  if (pmBusy()) {
+    if (!pmFwOp()) { if (pmDeadline) pmDeadline = millis() + 60000; if (pmSleepAt) pmSleepAt = millis() + 60000; return; }
+    if (pmOn) {                                     // operacja na firmware: tryb POWMAN wylaczany automatycznie                                     // ponowne wlaczenie tylko swiadomie (USPIJ_POWMAN:TAK)
+      pmSetFlag(false); pmSleepAt = pmDeadline = 0;
+      logText("[POWMAN] Operacja na firmware - tryb POWMAN wylaczony automatycznie (wlacz ponownie: USPIJ_POWMAN)\n");
+      queueLora("PICO: tryb POWMAN wylaczony (operacja na firmware) - wlacz ponownie USPIJ_POWMAN", 0);
+    }
+    return;
+  }
+  if (pmDeadline && (int32_t)(millis() - pmDeadline) >= 0) {
+    pmDeadline = 0;
+    logText("[POWMAN] Koniec czuwania - sprawdzam wezel przed snem\n");
+    pmCheckDone = false; pmCheckReq = true;
+    uint32_t t0 = millis(); while (!pmCheckDone && millis() - t0 < 600000UL) { rp2040.wdt_reset(); server.handleClient(); delay(20); }
+    uint32_t t1 = millis(); while (loraQn && millis() - t1 < 180000UL) { rp2040.wdt_reset(); delay(50); }   // raport LoRa wyslany
+    pmSleepAt = millis() + 1000;
+  }
+  if (pmSleepAt && (int32_t)(millis() - pmSleepAt) >= 0) {
+    pmSleepAt = 0;
+    if (!pmGoSleep()) pmDeadline = millis() + (uint32_t)cfg.pmCzuw * 60000UL;   // nie wyszlo - kolejne czuwanie
+  }
+}
+// Aktywnosc uzytkownika w czasie czuwania (komenda LoRa, logowanie na strone) przedluza czuwanie
+void pmExtend() {
+  if (pmOn && pmDeadline) { uint32_t d = millis() + (uint32_t)cfg.pmCzuw * 60000UL; if ((int32_t)(d - pmDeadline) > 0) pmDeadline = d; }
+}
+String pmStatus() {
+  if (!pmOn) return "POWMAN wylaczony";
+  String s = "POWMAN wlaczony (pobudka " + cfg.pmTime + ", czuwanie " + cfg.pmCzuw + " min";
+  if (pmDeadline) s += String(", do snu ") + ((pmDeadline - millis()) / 60000 + 1) + " min";
+  return s + ")";
+}
+
 // Restart na zadanie: znacznik w rejestrze watchdoga (przezywa restart), zeby po starcie nie pokazywac "WATCHDOG"
 void plannedReboot() { watchdog_hw->scratch[2] = PLANNED_MAGIC; rp2040.reboot(); }
 
@@ -2155,7 +2574,39 @@ void core1Check() {
   flushLogToFlash("zawieszenie rdzenia 1");
 }
 
+// Po starcie Pico (aktualizacja, pobudka z POWMAN, zasilanie) host USB bywa martwy: wezel pracuje, a linia
+// wyglada na pusta - pomaga zwykly restart Pico. Robimy go sami RAZ na epizod: znacznik w LittleFS blokuje
+// kolejne restarty, dopoki wezel sie nie pojawi (wezel naprawde bez zasilania = brak petli restartow).
+void usbBootFixService() {
+  static bool done = false, flag = false;
+  if (!fsReady) return;
+  bool jest = heltecMounted || usbDevicePresent();
+  if (done) {                                            // znacznik zostal - usun, gdy wezel w koncu sie pojawi
+    if (flag && jest) { LittleFS.remove(USBFIX_PATH); flag = false; }
+    return;
+  }
+  if (jest) { if (LittleFS.exists(USBFIX_PATH)) LittleFS.remove(USBFIX_PATH); done = true; return; }
+  if (millis() < 25000 || fwState == 1) return;
+  done = true;
+  if (pmWoke || pmOn) {                                  // tryb POWMAN: osobna procedura - bez restartu Pico,
+    logText("[POWMAN] Po pobudce nie widac wezla na USB - bez restartu Pico, wezel sprawdzi koniec czuwania\n");
+    return;                                              // wezel sprawdza pmNodeCheck przed snem (odzyskiwanie jak straznik)
+  }
+  if (LittleFS.exists(USBFIX_PATH)) {
+    flag = true;
+    logText("[PICO] Nadal nie widac wezla na USB po restarcie Pico - bez kolejnych restartow (straznik zajmie sie wezlem)\n");
+    return;
+  }
+  File f = LittleFS.open(USBFIX_PATH, "w"); if (f) { f.print("1"); f.close(); }
+  logText(picoUpdBoot ? "[PICO] Po aktualizacji Pico nie widac wezla na USB - jednorazowy restart Pico\n"
+                      : "[PICO] Po starcie nie widac wezla na USB - jednorazowy restart Pico\n");
+  flushLogToFlash("restart Pico (brak wezla na USB)");
+  delay(200);
+  plannedReboot();
+}
+
 void loop() {
+  usbBootFixService();
   { uint32_t beat = core1Beat; if ((int32_t)(millis() - beat) < 3000) rp2040.wdt_reset(); }
   if (wifiState != 1) {
     if (!staActive) dnsServer.processNextRequest();
@@ -2166,6 +2617,7 @@ void loop() {
   netService();
   wifiService();
   checkBootselReset();
+  pmService();
   ledService();
   logFlashService();
   if (picoRebootAt && (int32_t)(millis() - picoRebootAt) > 0) plannedReboot();
@@ -2250,6 +2702,11 @@ void nodeWatchService() {
     logf("[PICO] Straznik: %lu min bez logow, wezel odpowiada na API - wszystko w porzadku\n", (unsigned long)cisza);
     lastCheck = millis(); return;
   }
+  if (!nodeRecover(cisza, "").length()) logf("[PICO] Straznik: wezel nadal nie odpowiada - kolejna proba za %d min\n", cfg.brakOdp);
+  lastCheck = millis();
+}
+// Odzyskiwanie wezla: restart USB -> RTS -> impuls na pinie (bez USB przy pustej linii). Zwraca co pomoglo ("" = nic).
+String nodeRecover(uint32_t cisza, const char* pref) {
   logf("\n[PICO] Straznik: wezel nie odpowiada od %lu min%s - odzyskiwanie\n", (unsigned long)cisza,
        cdcIdx == 0xFF ? " (nie widac go na USB)" : "");
   String pomoglo;
@@ -2275,15 +2732,31 @@ void nodeWatchService() {
       if (nodeAliveAfter(t, 120000)) pomoglo = String("impuls GP") + cfg.rstPin;
     }
   }
-  lastCheck = millis();
   if (pomoglo.length()) {
     logf("[PICO] Straznik: wezel znow odpowiada - pomogl %s\n", pomoglo.c_str());
-    queueLora(String("PICO: wezel nie odpowiadal ") + cisza + " min - pomogl " + pomoglo, 60000);
-  } else logf("[PICO] Straznik: wezel nadal nie odpowiada - kolejna proba za %d min\n", cfg.brakOdp);
+    queueLora(String("PICO: ") + pref + "wezel nie odpowiadal " + cisza + " min - pomogl " + pomoglo, 60000);
+  }
+  return pomoglo;
+}
+
+
+void pmNodeCheck() {
+  uint32_t rx = lastRxMs;
+  if (cdcIdx != 0xFF && rx && millis() - rx < 300000UL) { logText("[POWMAN] Wezel aktywny (dane z USB)\n"); return; }
+  uint32_t ago = apiAgoSec();
+  if (heltecMounted && ago < 1200) {                 // kazde sprawdzenie API przedluza wezlowi tryb API (cisza w logach)
+    logf("[POWMAN] Wezel na USB, kontakt API %lu min temu - bez sprawdzania (nie przedluzam trybu API)\n", (unsigned long)(ago / 60));
+    return;
+  }
+  if (heltecMounted && apiProbe()) { logText("[POWMAN] Wezel odpowiada na API\n"); return; }
+  if (!nodeRecover(rx ? (millis() - rx) / 60000UL : millis() / 60000UL, "(POWMAN) ").length())
+    logText("[POWMAN] Wezel nadal nie odpowiada - zasypiam, sprobuje przy nastepnej pobudce\n");
 }
 
 void loop1() {
   core1Beat = millis();
+  if (pmPark) pmCore1Park();
+  if (pmCheckReq) { pmCheckReq = false; pmNodeCheck(); pmCheckDone = true; }
   USBHost.task();
   crumb(CR_IDLE);
 
@@ -2310,6 +2783,36 @@ void loop1() {
     resetNodeAfterUpdate = false;
     logText("[PICO] Po aktualizacji Pico: reset wezla (RTS), zeby wystartowal od nowa z logami\n");
     resetNodeFull();
+    if (LittleFS.exists(NODE_RST_PATH)) LittleFS.remove(NODE_RST_PATH);
+  }
+
+  // Po restarcie samego Pico wezel bywa w trybie API sprzed restartu i nie wysyla logow tekstowych (do 15 min).
+  // Raz po starcie: 20 s ciszy -> polaczenie API i "disconnect" (wezel wraca do logow); dalej cisza -> reset RTS.
+  static uint8_t logFix = 0; static uint32_t logFixT = 0, logFixB = 0;
+  if (logFix < 3 && heltecMounted && fwState != 1 && !seq && !resetNodeAfterUpdate) {   // po aktualizacji: reset wyzej
+    if (!logFixT) { logFixT = millis(); logFixB = nodeLines; }
+    else if (millis() - logFixT > 30000) {
+      bool cisza = nodeLines == logFixB;                // ani jednej linii logu przez 30 s
+      if (logFix == 0) {
+        if (cisza && (pmWoke || pmOn)) {
+          // POWMAN: bez polaczenia API i bez resetu. Kazdy kontakt API (tez "disconnect") odnawia na wezle
+          // 15-minutowy tryb API, wiec logi nigdy by nie wrocily. Bez kontaktu wroca same.
+          logText("[POWMAN] Wezel bez logow tekstowych (po komendzie/odpowiedzi LoRa przelaczyl port w tryb API do restartu) - "
+                  "bez resetu wezla. Aby logi plynely: w aplikacji Meshtastic Konfiguracja > Security > Debug log (security.debug_log_api_enabled = true), "
+                  "teraz: przycisk Reset wezla\n");
+          logFix = 3;
+        } else if (cisza) {
+          logText("[PICO] Wezel podlaczony, ale nie wysyla logow (tryb API sprzed restartu Pico) - zamykam sesje API\n");
+          if (apiConnect()) { usbWriteAll(API_DISC, sizeof(API_DISC)); apiPump(300); }
+          apiMode = false;
+          logFix = 1; logFixT = millis(); logFixB = nodeLines;
+        } else logFix = 3;
+      } else if (logFix == 1) {
+        if (cisza) { logText("[PICO] Wezel dalej bez logow - reset wezla (RTS)\n"); resetNodeFull(); }
+        else logText("[PICO] Logi wezla wrocily\n");
+        logFix = 3;
+      }
+    }
   }
 
   // Pico zrestartowalo sie w trakcie wysylania konfiguracji po flashowaniu - jedna proba wznowienia
@@ -2338,7 +2841,7 @@ void loop1() {
     reqCmd = 0;
     if      (cmd == 1) resetNodeFull();
     else if (cmd == 2) startSeq(SEQ_BOOT, 5, "bootloader DTR/RTS");
-    else if (cmd == 4) restartUsbHost();
+    else if (cmd == 4) restartUsbHost(true);           // przycisk na stronie: restart nawet przy pustej linii
     else if (cmd == 5) { seq = nullptr; bootloaderTest(); }
     else if (cmd == 6) { seq = nullptr; flashPackage(); }
     else if (cmd == 7) { seq = nullptr; configFromPackage(); }
@@ -2415,26 +2918,43 @@ void loraCmdService() {
       break;
     }
   }
-  static const char* const SET_KEYS[] = { "AP_SSID", "AP_PWD", "STA_SSID", "STA_PWD", "MODE_WIFI", "FILTR_NODE", "ADRES_URL", "BRAK_ODPOWIEDZI" };
+  static const char* const SET_KEYS[] = { "AP_SSID", "AP_PWD", "STA_SSID", "STA_PWD", "MODE_WIFI", "FILTR_NODE", "ADRES_URL", "BRAK_ODPOWIEDZI",
+                                          "POWMAN_TIME", "POWMAN_CZUWANIE" };
   int setIdx = -1, cmdIdx = -1;
-  if (hasVal) for (int i = 0; i < 8; i++) if (key == SET_KEYS[i]) setIdx = i;
+  if (hasVal) for (int i = 0; i < 10; i++) if (key == SET_KEYS[i]) setIdx = i;
   if (!hasVal) for (int i = 0; i < 5; i++) if (cfg.cmd[i] == key) cmdIdx = i;
   bool help = !hasVal && key == "HELP", wersje = !hasVal && key == "WERSJE";
   bool dl = hasVal && key == "POBIERZ_INTERNET", upd = !hasVal && key == "AKTUALIZUJ_INTERNET";
-  if (setIdx < 0 && cmdIdx < 0 && !help && !wersje && !dl && !upd) return;   // zwykla wiadomosc na kanale
+  bool spij = key == "USPIJ_POWMAN";
+  if (setIdx < 0 && cmdIdx < 0 && !help && !wersje && !dl && !upd && !spij) return;   // zwykla wiadomosc na kanale
   if (!senderAllowed(from)) { logf("[PICO] Komenda od niedozwolonego nadawcy !%08lx - pominieta\n", (unsigned long)from); return; }
   logf("[PICO] Komenda LoRa '%s' od !%08lx\n", key.c_str(), (unsigned long)from);
+  pmExtend();                                                // komenda w czasie czuwania POWMAN przedluza czuwanie
+  if (spij) {
+    String v = val; v.toUpperCase();
+    String opis; pmNextSleep(opis);
+    if (!hasVal) { queueLora(String("PICO: potwierdz USPIJ_POWMAN:TAK - sen POWMAN, wybudzenie pinem GP14") +
+                             (cfg.pmTime != "0" ? String(" + timer (") + cfg.pmTime + "), czuwanie " + cfg.pmCzuw + " min" : String(", bez timera")), 0); return; }
+    if (v != "TAK") { queueLora("PICO: BLAD USPIJ_POWMAN - potwierdz wpisujac USPIJ_POWMAN:TAK", 0); return; }
+    pinMode(PM_WAKE_PIN, INPUT_PULLDOWN); delay(2);
+    if (digitalRead(PM_WAKE_PIN)) { queueLora("PICO: BLAD USPIJ_POWMAN - GP14 w stanie wysokim, ustaw pin wezla na 0", 0); return; }
+    pmSetFlag(true); pmDeadline = 0; pmSleepAt = millis() + 60000;
+    logText("[POWMAN] Tryb POWMAN wlaczony komenda LoRa - sen za 60 s\n");
+    queueLora(String("PICO: zasypiam za 1 min (POWMAN), pobudka ") + opis + ", wybudzenie pinem GP14", 0);
+    return;
+  }
   char r[120] = "";
   if (help) {
     String l = "PICO komendy: HELP";
     for (int i = 0; i < 5; i++) l += ", " + cfg.cmd[i];
+    l += ", USPIJ_POWMAN";
     queueLora(l, 0);                                         // 1/5: komendy
     queueLora("PICO ustawienia: WERSJE, AP_SSID:, AP_PWD:, STA_SSID:, STA_PWD:, MODE_WIFI:AP/STA, FILTR_NODE:, ADRES_URL:, BRAK_ODPOWIEDZI:, "
               "POBIERZ_INTERNET:pelna/aktualizacja/pico, AKTUALIZUJ_INTERNET", 0);   // 2/5
     queueLora(statusLine(), 0);                              // 3/5: Wi-Fi
     queueLora(String("PICO: filtr wezlow: ") + (cfg.senders.length() ? cfg.senders : String("wszyscy")) + "; BRAK_ODPOWIEDZI: " +
               (cfg.brakOdp ? String(cfg.brakOdp) + " min, pin resetu " + (cfg.rstPin >= 0 ? "GP" + String(cfg.rstPin) : String("brak"))
-                           : String("wylaczone")), 0);   // 4/5
+                           : String("wylaczone")) + "; " + pmStatus() + " - ust. POWMAN_TIME:, POWMAN_CZUWANIE:", 0);   // 4/5
     String di = readFileStr(DL_INFO_PATH); di.trim();
     int p1 = di.indexOf('|'), p2 = di.indexOf('|', p1 + 1);
     String co = (p1 > 0 && p2 > p1) ? di.substring(0, p1) + " " + di.substring(p1 + 1, p2) : String("nic");
@@ -2476,7 +2996,8 @@ void loraCmdService() {
     return;
   }
   if (upd) { updReq = true; return; }
-  if (cmdIdx == 0)      { wifiReq = 0; snprintf(r, sizeof(r), "PICO: Wi-Fi wlaczone (%s)", cfg.sta ? "STA" : "AP"); }
+  if (cmdIdx == 0 && pmOn) { pmSetFlag(false); pmSleepAt = pmDeadline = 0; logText("[POWMAN] Tryb POWMAN wylaczony komenda LoRa\n"); }
+  if (cmdIdx == 0)      { wifiReq = 0; snprintf(r, sizeof(r), "PICO: Wi-Fi wlaczone (%s)%s", cfg.sta ? "STA" : "AP", pmOn ? "" : ", POWMAN wylaczony"); }
   else if (cmdIdx == 1) { wifiReq = 1; snprintf(r, sizeof(r), "PICO: usypiam (Wi-Fi wylaczone)"); }
   else if (cmdIdx == 2) { wifiReq = 2; snprintf(r, sizeof(r), "PICO: staly AP '%s' dla wezli", cfg.apSsid.c_str()); }
   else if (cmdIdx == 3) { wifiReq = 0; snprintf(r, sizeof(r), "PICO: koniec trybu AP, Wi-Fi wg ustawien"); }
@@ -2512,6 +3033,15 @@ void loraCmdService() {
     int m = num ? val.toInt() : -1;
     if (m != 0 && (m < 5 || m > 1440)) err = "podaj 0 (wylaczone) albo 5-1440 minut";
     else { cfg.brakOdp = m; shown = m ? String(m) + " min" : String("0 (wylaczone)"); }
+  } else if (setIdx == 8) {                                   // POWMAN_TIME
+    String v = val; v.replace(" ", ""); v.toLowerCase();
+    if (!pmTimeOk(v)) err = "podaj 0, co ile godzin (1-168), godziny np. 6,18 albo test np. 5m";
+    else { cfg.pmTime = v; shown = v == "0" ? String("0 (bez timera)") : v; }
+  } else if (setIdx == 9) {                                   // POWMAN_CZUWANIE
+    bool num = val.length() > 0; for (size_t i = 0; i < val.length(); i++) if (!isdigit(val[i])) num = false;
+    int m = num ? val.toInt() : -1;
+    if (m < 1 || m > 240) err = "podaj 1-240 minut";
+    else { cfg.pmCzuw = m; shown = String(m) + " min"; }
   } else if (setIdx == 5) {                                   // FILTR_NODE
     String v = val; v.toLowerCase(); v.replace(" ", ","); v.replace(";", ",");
     String out; int cnt = 0;
@@ -2572,8 +3102,10 @@ void heltecText(const uint8_t* in, int n) {
     if (escState == 2) { if (c >= 0x40 && c <= 0x7E) escState = 0; continue; }
     if (c == 0x1B) { escState = 1; continue; }
     if (c == '\r') continue;
+    if (c < 0x20 && c != '\n' && c != '\t') continue;   // binarne smieci (np. ramki API) - bez NUL w logu
     out[o++] = c;
     if (c == '\n') {
+      nodeLines++;
       line[lineLen] = 0;
       const char* p = strstr(line, "nodenum 0x");
       if (p) { uint32_t v = strtoul(p + 10, nullptr, 16); if (v) logNodeNum = v; }
@@ -2589,7 +3121,7 @@ void heltecText(const uint8_t* in, int n) {
 
 // W trybie API: ramki 0x94 0xC3 len_hi len_lo + FromRadio; reszta to tekst
 // Ramki 0x94 0xC3 len_hi len_lo + FromRadio; wszystko inne to tekst logu. Dziala zawsze:
-// po uzyciu API wezel przez ok. 15 min wysyla logi jako LogRecord (gdy wlaczone debug_log_api_enabled)
+// po pierwszym uzyciu API wezel do restartu wysyla logi tylko jako LogRecord (gdy wlaczone debug_log_api_enabled)
 // i przekazuje odebrane wiadomosci jako pakiety - z nich tez czytamy komendy.
 void apiFeed(const uint8_t* in, int n) {
   static uint8_t st = 0; static uint16_t need = 0, got = 0;
@@ -2797,6 +3329,9 @@ void netUpdate() {
     uint32_t c = 0xFFFFFFFF, got = 0;
     { File f = LittleFS.open(PICO_DL_PATH, "r"); size_t n; while (f && (n = f.read(dlBuf, sizeof(dlBuf))) > 0) { c = crc32Calc(c, dlBuf, n); got += n; rp2040.wdt_reset(); } if (f) f.close(); }
     if (got != size || (~c) != crc) { LittleFS.remove(PICO_DL_PATH); LittleFS.remove(DL_INFO_PATH); queueLora("PICO: BLAD - program Pico uszkodzony w pamieci, usuniety", 0); return; }
+    if (!picoBinOk(PICO_DL_PATH)) { LittleFS.remove(PICO_DL_PATH); LittleFS.remove(DL_INFO_PATH);
+      logText("[PICO] Odrzucono pobrany program Pico - brak znacznika PICOVER (to nie Pico2W flasher)\n");
+      queueLora("PICO: BLAD - pobrany plik to nie program Pico2W flasher, odrzucony", 0); return; }
     LittleFS.remove(PICO_BIN); LittleFS.remove(CFG_PENDING_PATH);
     if (!LittleFS.rename(PICO_DL_PATH, PICO_BIN)) { queueLora("PICO: BLAD - nie mozna przygotowac aktualizacji Pico", 0); return; }
     LittleFS.remove(DL_INFO_PATH);
