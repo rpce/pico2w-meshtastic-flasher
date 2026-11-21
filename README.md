@@ -1,6 +1,6 @@
 # Pico2W flasher – zdalny flasher i zbieracz logów dla węzła Meshtastic (ESP32-S3)
 
-**Aktualna wersja: 0.40**
+**Aktualna wersja: 0.41**
 
 - **Pomysłodawca projektu:** Rafał Cichosz (rpc)
 - **Kodowanie:** Claude Opus 5.5
