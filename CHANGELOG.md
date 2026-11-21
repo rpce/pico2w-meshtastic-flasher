@@ -4,6 +4,19 @@ Program Pico i skrypt `wyslij_firmware.py` mają zawsze ten sam numer wersji.
 
 Pomysłodawca projektu: Rafał Cichosz (rpc) · Kodowanie: Claude Opus 5.5
 
+## [0.41] – 2026-11-21
+
+### Dodane
+- **Kontrola zasobów Pico**: rekordy od startu (najmniej wolnego RAM, najdłuższy obieg pętli rdzenia 0 i 1), wolny RAM 10 min po starcie, wolne miejsce we flashu.
+- **Ostrzeżenia w zdarzeniach i przez LoRa** (każdy rodzaj najwyżej raz na dobę): mało RAM (< 30 KB), możliwy wyciek pamięci (wolny RAM w spoczynku spada co godzinę przez 6 h, łącznie ≥ 16 KB), przeciążony rdzeń (obieg pętli > 5 s rdzeń 0, > 1 s rdzeń 1), mało miejsca we flashu (< 48 KB). Bez ostrzeżeń w trakcie operacji na firmware.
+- **Ustawienie *Ostrzeżenia zasobów przez LoRa*** (domyślnie tak, skrypt `ZASOBY_LORA=TAK/NIE`) – przez LoRa idą tylko alarmy; wyłączone = sam wpis w zdarzeniach.
+- **Komenda LoRa `ZASOBY`** – stan zasobów w jednej wiadomości; wpis `[ZASOBY]` w zdarzeniach co 3 h; rekordy i liczba ostrzeżeń w pasku stanu strony.
+- Odpowiedź `ZASOBY` pokazuje zapas: wolne z całości i procent (RAM, flash), obiegi pętli na sekundę obu rdzeni.
+
+### Pozostałe
+- Instrukcja: rozdział o kontroli zasobów (progi, jak odczytać zapas) oraz całkowite czyszczenie Pico pakietem [Pico Universal Flash Nuke](https://github.com/Gadgetoid/pico-universal-flash-nuke) (sprawdzone na Pico 2 W).
+- Źródła: linia `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` w `pico2w_flasher_meshtastic.ino` i `wyslij_firmware.py`.
+
 ## [0.40] – 2026-11-21
 
 Zmiany od wydania 0.28 (wersje robocze 0.29–0.39 nie były publikowane).
