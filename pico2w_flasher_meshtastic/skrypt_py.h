@@ -2,7 +2,7 @@
 // Wygenerowane automatycznie z wyslij_firmware.py - nie edytowac recznie.
 // Plik musi lezec w folderze szkicu obok pico2w_flasher_meshtastic.ino.
 #pragma once
-#define SKRYPT_PY_WERSJA "0.28"
+#define SKRYPT_PY_WERSJA "0.40"
 static const char SKRYPT_PY[] = R"PYSKRYPT(#!/usr/bin/env python3
 """
 wyslij_firmware.py - pomyslodawca projektu: Rafal Cichosz (rpc)
@@ -82,12 +82,13 @@ AKTUALIZACJA PRZEZ INTERNET (Pico w trybie STA pobiera pliki z Twojego serwera W
   Program Pico - zawsze OSOBNYM poleceniem (rzadko), do tego samego folderu:
      python3 wyslij_firmware.py --przygotuj-serwer komin --pico-fw pico2w_flasher_meshtastic.ino.bin --token MojeHaslo
   (-f i --pico-fw razem sa odrzucane - wezel i Pico przygotowujesz i aktualizujesz oddzielnie)
-  Potem przez LoRa:  POBIERZ_INTERNET:pelna (albo :aktualizacja / :pico), a po potwierdzeniu  AKTUALIZUJ_INTERNET
+  Potem przez LoRa:  POBIERZ_INTERNET:pelna:PIASEK (albo aktualizacja / pico), a po potwierdzeniu  AKTUALIZUJ_INTERNET
+  PIASEK to 6-znakowy kod, ktory skrypt wypisuje przy przygotowaniu plikow (od 0.29) - zapisz go.
 
 KOMENDA LoRa WERSJE (Pico 0.24+): wersja firmware odczytana z wezla, OTA i konfiguracja ostatnio wgrane przez Pico.
 
 LOGI:
-  python3 wyslij_firmware.py --logi                    (3 logi do nowego folderu logi_pico_RRRRMMDD_GGMM)
+  python3 wyslij_firmware.py --logi                    (4 logi do nowego folderu logi_pico_RRRRMMDD_GGMM)
   python3 wyslij_firmware.py --logi moje_logi --ip pico-flasher.local --token MojeHaslo
   python3 wyslij_firmware.py -f firmware-...bin --logi  (wgranie, a po nim logi; przy bledzie logi tez sie pobiora)
 
@@ -100,7 +101,13 @@ USTAWIENIA PICO (od 0.26; wszystko oprocz tokenu - token zmieniasz tylko na stro
   python3 wyslij_firmware.py --ustaw "ADRES_URL=https://serwer/komin/mtnod.txt" --ustaw FILTR_NODE=04a9d917,6ecc4f80
   Klucze: AP_SSID, AP_PWD, STA_SSID, STA_PWD, MODE_WIFI (AP/STA), KANAL (0-7), FILTR_NODE (min. 2 wezly albo *),
   ADRES_URL (pusty = brak), BRAK_ODPOWIEDZI (minuty, 0 = wylaczone), PIN_RESETU (GP, -1 = brak),
-  RESET_STAN (WYSOKI/NISKI), RESET_CZAS (1-60 s), POWMAN_TIME (0 / 12 / 6,18 / 5m), POWMAN_CZUWANIE (1-240), KOMENDA_WLACZ, KOMENDA_USPIJ, KOMENDA_AP_WLACZ,
+  RESET_STAN (WYSOKI/NISKI), RESET_CZAS (1-60 s), POWMAN_TIME (0 / 12 / 6,18 / 30m, min. 5m), POWMAN_CZUWANIE (1-240),
+  NAPIECIE_KOREKTA (V, np. 0.25), NAPIECIE_PROG (V, 0 = wylaczony, np. 4.60),
+  IP_DOZWOLONE (np. 192.168.1.98,192.168.1.*; puste = wszystkie; tylko tryb STA),
+  TRYB_SIECI (wifi / eth / oba / brak), MODUL_ETH (W5500 / W5100S), HOP (0-7), STRONA (WL / WYL),
+  DEBUG_LOG_AUTO (TAK / NIE), PORT_WEZLA (0 / 30m / 2h / 1d, max 7d - port TCP 4403 do wezla, tylko siec lokalna),
+  IPW, IPE (staly adres Wi-Fi / Ethernet, jak w LoRa:
+  ip/maska,brama[,dns] np. 192.168.1.40/24,192.168.1.1; - = DHCP), KOMENDA_WLACZ, KOMENDA_USPIJ, KOMENDA_AP_WLACZ,
   KOMENDA_AP_WYLACZ, KOMENDA_TEMP. Separator '=' albo ':' (pierwszy w tekscie, jak w komendach LoRa).
   Pico sprawdza wartosci tak samo jak w panelu. Od 0.27 restartuje sie tylko po zmianie Wi-Fi
   (AP_SSID, AP_PWD, STA_SSID, STA_PWD, MODE_WIFI); pozostale zmiany dzialaja od razu.
@@ -116,6 +123,7 @@ Inne:
 import argparse
 import hashlib
 import json
+import re
 import os
 import struct
 import sys
@@ -127,7 +135,7 @@ try:
 except ImportError:
     requests = None             # zostanie doinstalowane w srodowisku venv
 
-WERSJA = "0.28"
+WERSJA = "0.40"
 DEFAULT_IP = "192.168.4.1"
 DEFAULT_TOKEN = "MojeBezpieczneHaslo123"
 # Wlasne srodowisko w podfolderze obok skryptu - niezalezne od starej wersji z pakietow Debiana
@@ -152,7 +160,259 @@ def jest_internet(host="pypi.org", port=443, czas=3):
         return False
 
 
-def sprawdz_wersje_pico(ip, token):
+# ---- Logowanie skryptu (od 0.39): haslo podajesz raz, skrypt loguje sie do Pico i zapamietuje tylko SESJE
+# (osobno dla kazdego adresu Pico). Sesja wygasa po 30 min bez uzycia - wtedy skrypt pyta o haslo ponownie.
+# Haslo nie jest zapisywane na dysku. --token loguje bez pytania (np. w automatach).
+PLIK_SESJI = os.path.join(DEFAULT_VENV, "pico_sesje.json")
+STARY_PLIK_TOKENOW = os.path.join(DEFAULT_VENV, "pico_tokeny.json")   # do 0.38: zapisane hasla - usuwany
+
+
+def _sesje():
+    try:
+        with open(PLIK_SESJI, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def sesja_dla(ip):
+    """Zapamietana sesja (od 0.40 razem z kluczem do podpisow); bez klucza = brak sesji."""
+    w = _sesje().get(ip)
+    if not isinstance(w, dict) or not w.get("sid") or not w.get("k"):
+        return None
+    _POD["k"] = bytes.fromhex(w["k"])
+    return w["sid"]
+
+
+# ---- Podpis kazdego zadania (od 0.40): X-Licznik + X-Podpis = HMAC(K, metoda, sciezka, licznik, argumenty, naglowki)
+_POD = {"k": None, "n": int(time.time() * 1000)}
+PODP_NAGL = ("X-Offset", "X-Chunk-CRC", "X-Chunk-SHA", "X-Total-Size", "X-Total-CRC", "X-Target", "X-Time")
+
+
+def podpisz(metoda, url, dane, naglowki):
+    """Dopisuje do naglowkow licznik i podpis (gdy znany klucz sesji). dane: dict (formularz) albo bytes."""
+    import hmac as _h
+    from urllib.parse import urlsplit, parse_qsl
+    if not _POD["k"]:
+        return naglowki
+    h = dict(naglowki)
+    if isinstance(dane, (bytes, bytearray)) and "X-Chunk-SHA" not in h:
+        h["X-Chunk-SHA"] = hashlib.sha256(dane).hexdigest()
+    _POD["n"] += 1
+    u = urlsplit(url)
+    args = parse_qsl(u.query, keep_blank_values=True)
+    if isinstance(dane, dict):
+        args += [(str(k), str(v)) for k, v in dane.items()]
+    m = f"{metoda.upper()}\n{u.path or '/'}\n{_POD['n']}\n" + "".join(f"{k}={v}\n" for k, v in sorted(args))
+    m += "".join(f"{x}:{h[x]}\n" for x in PODP_NAGL if h.get(x))
+    h["X-Licznik"] = str(_POD["n"])
+    h["X-Podpis"] = _h.new(_POD["k"], m.encode("utf-8"), hashlib.sha256).hexdigest()
+    return h
+
+
+def wlacz_podpisy():
+    """Kazde zadanie requests do Pico (z X-Auth-Token) dostaje podpis."""
+    if requests is None or getattr(requests.Session.request, "_podpis", False):
+        return
+    oryg = requests.Session.request
+
+    def zadanie(self, method, url, **kw):
+        h = kw.get("headers") or {}
+        if "X-Auth-Token" in h:
+            kw["headers"] = podpisz(method, url, kw.get("data"), h)
+        return oryg(self, method, url, **kw)
+    zadanie._podpis = True
+    requests.Session.request = zadanie
+
+
+def _zapisz_sesje(d):
+    os.makedirs(DEFAULT_VENV, exist_ok=True)
+    with open(PLIK_SESJI, "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+    try:
+        os.chmod(PLIK_SESJI, 0o600)
+    except Exception:
+        pass
+
+
+def zapamietaj_sol(id_, sol, ip=None):
+    """Sol zapisana pod identyfikatorem Pico (niezalezna od adresu IP / DHCP)."""
+    d = _sesje()
+    d.setdefault("_sol", {})[id_] = sol
+    if ip:
+        d.setdefault("_ip", {})[ip] = id_
+    _zapisz_sesje(d)
+
+
+def sol_pico(id_):
+    return _sesje().get("_sol", {}).get(id_.lower())
+
+
+def id_dla(ip):
+    return _sesje().get("_ip", {}).get(ip)
+
+
+def sol_dla(ip):
+    d = _sesje()
+    id_ = d.get("_ip", {}).get(ip)
+    if id_ and d.get("_sol", {}).get(id_):
+        return d["_sol"][id_]
+    w = d.get(ip)
+    return (w or {}).get("sol") if isinstance(w, dict) else None
+
+
+def zapamietaj_sesje(ip, sid, sol=None, k=None):
+    d = _sesje()
+    stare = d.get(ip) if isinstance(d.get(ip), dict) else {}
+    d[ip] = {"sid": sid, "sol": sol or stare.get("sol"), "k": k if k is not None else stare.get("k")}
+    _zapisz_sesje(d)
+
+
+_HASLO = None          # haslo podane w tym uruchomieniu - tylko w pamieci (np. ponowne logowanie po restarcie Pico)
+
+
+def skrot_hasla(haslo, sol):
+    """PBKDF2-HMAC-SHA256 (10000, sol z Pico) - tak samo liczy Pico i strona; hasla nie wysylamy."""
+    return hashlib.pbkdf2_hmac("sha256", haslo.encode("utf-8"), bytes.fromhex(sol), 10000, 32)
+
+
+_SOL_ZMIANA = {}       # ip -> id Pico, ktorego sol zmienila sie od ostatniego razu
+
+
+def pobierz_sol(ip):
+    """Sol hasla z Pico (GET /hello); None = Pico sprzed 0.40."""
+    try:
+        r = requests.get(f"http://{ip}/hello", headers={"Connection": "close"}, timeout=10)
+    except Exception:
+        return None, None
+    if r.status_code == 404:
+        return None, None
+    if r.status_code in (403, 429):
+        blad(f"Pico odmowilo dostepu: {r.text.strip()}")
+    sol = re.search(r"sol=([0-9a-f]{32})", r.text)
+    np_ = re.search(r"np=([0-9a-f]{32})", r.text)
+    id_ = re.search(r"id=([0-9a-f]{12})", r.text)
+    if sol and id_:
+        stara = sol_pico(id_.group(1))
+        if stara and stara != sol.group(1):
+            _SOL_ZMIANA[ip] = id_.group(1)
+        zapamietaj_sol(id_.group(1), sol.group(1), ip)
+    return (sol.group(1) if sol else None), (np_.group(1) if np_ else None)
+
+
+def zaloguj(ip, haslo):
+    """Logowanie bez wysylania hasla (od 0.40): zwraca identyfikator sesji albo None przy zlym hasle."""
+    import hmac as _h
+    sol, np_ = pobierz_sol(ip)
+    if not sol:                                          # Pico sprzed 0.40: stare logowanie haslem
+        return zaloguj_stare(ip, haslo)
+    if ip in _SOL_ZMIANA:                                # ochrona przed podstawionym urzadzeniem (zgadywanie hasla offline)
+        print(f"\n[UWAGA] Pico {_SOL_ZMIANA[ip]} pod {ip} ma INNA sol hasla niz ostatnio.")
+        print("  Normalne po zmianie hasla strony. Jesli hasla nie zmieniales - to moze byc podstawione urzadzenie.")
+        if not sys.stdin.isatty() or input("  Logowac dalej? [t/N]: ").strip().lower() not in ("t", "tak", "y"):
+            blad("Przerwano logowanie")
+        del _SOL_ZMIANA[ip]
+    nc = os.urandom(16).hex()
+    K = _h.new(skrot_hasla(haslo, sol), f"K:{np_}:{nc}".encode(), hashlib.sha256).digest()
+    p = _h.new(K, b"login", hashlib.sha256).hexdigest()
+    try:
+        r = requests.post(f"http://{ip}/auth2", data={"nc": nc, "p": p, "k": "skrypt"},
+                          headers={"X-Klient": "skrypt", "Connection": "close"}, timeout=10)
+    except Exception as e:
+        blad(f"Pico {ip} nie odpowiada ({e})")
+    if r.status_code == 401:
+        return None
+    if r.status_code in (403, 429):
+        blad(f"Pico odmowilo dostepu: {r.text.strip()}")
+    sid = re.search(r"sid=([0-9a-f]{32})", r.text)
+    pico = re.search(r"pico=([0-9a-f]{64})", r.text)
+    if not sid or not pico or not _h.compare_digest(pico.group(1), _h.new(K, b"pico", hashlib.sha256).hexdigest()):
+        blad("Odpowiedz nie pochodzi od tego Pico (zly dowod) - przerywam")
+    _POD["k"] = K
+    zapamietaj_sesje(ip, sid.group(1), sol, K.hex())
+    return sid.group(1)
+
+
+def zaloguj_stare(ip, haslo):
+    """Pico sprzed 0.40: haslo w naglowku (tylko do aktualizacji Pico)."""
+    try:
+        r = requests.post(f"http://{ip}/auth", headers={"X-Auth-Token": haslo, "X-Klient": "skrypt", "Connection": "close"}, timeout=10)
+    except Exception as e:
+        blad(f"Pico {ip} nie odpowiada ({e})")
+    if r.status_code == 401:
+        return None
+    if r.status_code in (403, 429):
+        blad(f"Pico odmowilo dostepu: {r.text.strip()}")
+    sid = r.cookies.get("sid") or ""
+    if re.fullmatch(r"[0-9a-f]{32}", sid):
+        try:                                             # Pico 0.39 przyjmuje sesje w naglowku
+            if requests.get(f"http://{ip}/status", headers={"X-Auth-Token": sid}, timeout=10).status_code != 401:
+                zapamietaj_sesje(ip, sid)
+                return sid
+        except requests.exceptions.RequestException:
+            pass
+    print("Pico ma starszy program - w tym uruchomieniu uzywam hasla; po aktualizacji Pico juz bez hasla w sieci")
+    return haslo
+
+
+def zapytaj_token(ip, powod=""):
+    import getpass
+    if not sys.stdin.isatty():
+        blad(f"Brak waznej sesji dla Pico {ip} - podaj --token")
+    if powod:
+        print(powod)
+    for _ in range(3):
+        t = getpass.getpass(f"Haslo strony Pico {ip} (nie bedzie widoczne ani zapisane): ").strip()
+        if not t:
+            blad("Nie podano hasla.")
+        sid = zaloguj(ip, t)
+        if sid:
+            globals()["_HASLO"] = t
+            print("Zalogowano - sesja wazna 30 min od ostatniego uzycia (haslo nie jest zapisywane)")
+            return sid
+        print("Zle haslo.")
+    blad("Trzy bledne hasla - przerywam.")
+
+
+def zaloguj_ponownie(a, powod):
+    """Sesja przepadla (np. restart Pico): haslo z tego uruchomienia albo pytanie."""
+    sid = zaloguj(a.ip, _HASLO) if _HASLO else None
+    a.token = sid or zapytaj_token(a.ip, powod)
+    return a.token
+
+
+def haslo_lokalne(a):
+    """Haslo do podpisu mtnod.txt (--przygotuj-serwer): bez laczenia z Pico, dwa razy dla pewnosci."""
+    zapewnij_requests(a)            # ewentualne przejscie do venv PRZED pytaniem (inaczej haslo podawane dwa razy)
+    if a.token:
+        return a.token
+    import getpass
+    if not sys.stdin.isatty():
+        blad("Podaj haslo strony Pico w --token (potrzebne do podpisu mtnod.txt)")
+    h1 = getpass.getpass("Haslo strony Pico (do podpisu mtnod.txt, nie bedzie zapisane): ").strip()
+    h2 = getpass.getpass("Powtorz haslo: ").strip()
+    if not h1 or h1 != h2:
+        blad("Hasla sa rozne albo puste.")
+    return h1
+
+
+def ustal_token(a):
+    zapewnij_requests(a)                                # logowanie wymaga requests (inaczej start w venv)
+    wlacz_podpisy()
+    if os.path.exists(STARY_PLIK_TOKENOW):              # stare wersje zapisywaly hasla - usuwamy
+        try:
+            os.remove(STARY_PLIK_TOKENOW)
+            print(f"Usunieto stary plik z zapisanymi haslami: {STARY_PLIK_TOKENOW}")
+        except Exception:
+            pass
+    if a.token:
+        globals()["_HASLO"] = a.token
+        a.token = zaloguj(a.ip, a.token) or blad("Pico odrzucilo haslo podane w --token")
+    else:
+        a.token = sesja_dla(a.ip) or zapytaj_token(a.ip)
+
+
+def sprawdz_wersje_pico(ip, token, _proba=0):
     """Skrypt i program Pico musza miec ten sam numer wersji - inaczej skrypt konczy sie bledem
     (format pakietu lub polecen mogl sie zmienic). Wyjatek: --pico-fw (tym sie wersje wyrownuje)."""
     try:
@@ -160,7 +420,12 @@ def sprawdz_wersje_pico(ip, token):
     except Exception as e:
         blad(f"Nie mozna odczytac wersji Pico ({e}) - nic nie wysylam.")
     if r.status_code == 401:
-        blad("Pico odrzucilo token (--token) - nic nie wysylam.")
+        if _proba:
+            blad("Pico nie przyjmuje sesji skryptu - zaktualizuj Pico do wersji zgodnej ze skryptem")
+        token = zapytaj_token(ip, "Sesja wygasla albo haslo sie zmienilo - zaloguj sie ponownie:")
+        return sprawdz_wersje_pico(ip, token, 1)
+    if r.status_code in (403, 429):
+        blad(f"Pico odmowilo dostepu: {r.text.strip()}")
     import re
     m = re.search(r"wersja Pico ([^ |]+)", r.text)
     if not m:
@@ -171,6 +436,10 @@ def sprawdz_wersje_pico(ip, token):
              f"        Skrypt i Pico musza miec ten sam numer. Uzyj skryptu {m.group(1)} albo zaktualizuj Pico:\n"
              f"        --pico-fw pico2w_flasher_meshtastic.ino.bin  (program Pico w wersji {WERSJA})")
     print(f"Pico wersja {m.group(1)} - zgodna ze skryptem.")
+    globals()["_TOKEN_OK"] = token
+    if "DOMYSLNE LUB ZA KROTKIE HASLA" in r.text:
+        blad("Pico ma domyslne lub za krotkie haslo strony (token) albo haslo AP - zmien oba na stronie Pico\n"
+             "        (Ustawienia, min. 12 znakow, inne niz domyslne). Do tego czasu wysylanie jest zablokowane.")
 
 
 def czekaj_na_pico(ip):
@@ -374,6 +643,7 @@ def wyslij_kawalkami(baza, token, pakiet, crc, segmenty, cel=None):
             try:
                 r = requests.post(f"{baza}/fw_chunk", data=cialo, timeout=(10, 30),
                                   headers={**naglowki, "X-Offset": str(poz), "X-Chunk-CRC": f"{kcrc:08X}",
+                                           "X-Chunk-SHA": hashlib.sha256(kaw).hexdigest(),
                                            "Content-Type": f"multipart/form-data; boundary={granica}"})
             except requests.exceptions.RequestException as e:
                 czekaj = min(2 * proba, 10)
@@ -595,6 +865,13 @@ def lista_komend(prof, pb):
     if prof["ringtone"] and "set_ringtone_message" in pola:
         k.append((A(set_ringtone_message=prof["ringtone"]), 0, "ringtone"))
     sec = prof["cfg"].security if prof["cfg"].HasField("security") else None
+    if sec is not None and hasattr(sec, "debug_log_api_enabled") and not sec.debug_log_api_enabled:
+        # bez tej flagi kazda odpowiedz LoRa Pico (tryb API) zatrzymuje logi wezla do jego restartu
+        sec.debug_log_api_enabled = True
+        print("[INFO] security.debug_log_api_enabled = true dodane do konfiguracji (logi wezla plyna takze w trybie API)")
+    elif sec is None:
+        print("[UWAGA] Brak sekcji security w YAML - debug_log_api_enabled nie ustawione przez skrypt\n"
+              "        (wlaczy je Pico z opcja security.debug_log_api_auto_enabled = tak)")
     zarzadzany = sec is not None and getattr(sec, "is_managed", False)
     if sec is not None:
         s1 = type(sec)()
@@ -732,6 +1009,10 @@ def zbuduj_pakiet(factory, tylko_factory=False, tylko_ota=False, reset_ustawien=
             raw = plik
         else:
             if not os.path.isfile(plik):
+                if nazwa_obr == "ota":
+                    blad(f"Brak pliku OTA: {os.path.basename(plik)}\n"
+                         f"        Pelna instalacja wymaga programu OTA. Skopiuj go z tego samego archiwum firmware\n"
+                         f"        do folderu {os.path.dirname(plik) or '.'} albo podaj wlasny: --ota PLIK")
                 blad(f"Brak pliku {plik}")
             with open(plik, "rb") as fh:
                 raw = fh.read()
@@ -763,12 +1044,39 @@ def zbuduj_pakiet(factory, tylko_factory=False, tylko_ota=False, reset_ustawien=
     return spakuj(wpisy, erase_end if pelne else 0, flash_size, konfig)
 
 
+CFGX_OFFSET = 0xFFFFFFFD            # konfiguracja zaszyfrowana (pakiety na serwer, od 0.40)
+
+
+class Zaszyfrowana(bytes):
+    """Konfiguracja zaszyfrowana kluczem z hasla strony i piasku - Pico odszyfrowuje po pobraniu."""
+
+
+def szyfruj_konfig(konfig, token_hex, piasek):
+    """MTX1 + nonce(16) + szyfrogram + znacznik(32). Strumien: HMAC(Ksz, nonce||i), znacznik HMAC(Kmac, nonce||szyfrogram)."""
+    import hmac
+    import secrets
+    try:
+        h = bytes.fromhex(token_hex)
+        assert len(h) == 32
+    except (ValueError, AssertionError):
+        blad("Nie moge zaszyfrowac konfiguracji: brak soli hasla z Pico (Pico musi byc 0.40+ i osiagalne pod --ip)")
+    ks = hmac.new(h, ("szyfr:" + piasek).encode(), hashlib.sha256).digest()
+    km = hmac.new(h, ("mac:" + piasek).encode(), hashlib.sha256).digest()
+    nonce = secrets.token_bytes(16)
+    strumien = b"".join(hmac.new(ks, nonce + struct.pack(">I", i), hashlib.sha256).digest()
+                        for i in range((len(konfig) + 31) // 32))
+    szyfr = bytes(x ^ y for x, y in zip(konfig, strumien))
+    znacznik = hmac.new(km, nonce + szyfr, hashlib.sha256).digest()
+    return Zaszyfrowana(b"MTX1" + nonce + szyfr + znacznik)
+
+
 def spakuj(wpisy, erase_end, flash_size, konfig):
     """Format pakietu - musi odpowiadac PkgHdr / PkgEnt w szkicu Pico.
     eraseEnd = 0: bez pelnego kasowania. Wpis 'config' (offset 0xFFFFFFFF) nie jest flashowany."""
     wpisy = list(wpisy)
     if konfig is not None:
-        wpisy.append(("config", 0xFFFFFFFF, konfig, konfig, hashlib.md5(konfig).digest()))
+        wpisy.append(("configx" if isinstance(konfig, Zaszyfrowana) else "config",
+                      CFGX_OFFSET if isinstance(konfig, Zaszyfrowana) else 0xFFFFFFFF, konfig, konfig, hashlib.md5(konfig).digest()))
     if not wpisy:
         blad("Pakiet jest pusty")
     OPIS.append("pakiet utworzony: " + time.strftime("%Y-%m-%d %H:%M"))
@@ -819,7 +1127,11 @@ def aktualizuj_pico(a):
     baza = f"http://{a.ip}"
     czekaj_na_pico(a.ip)
     try:
-        st = requests.get(f"{baza}/status", headers={"X-Auth-Token": a.token}, timeout=10).text
+        r = requests.get(f"{baza}/status", headers={"X-Auth-Token": a.token}, timeout=10)
+        if r.status_code == 401:
+            a.token = zapytaj_token(a.ip, "Sesja wygasla albo haslo sie zmienilo - zaloguj sie ponownie:")
+            r = requests.get(f"{baza}/status", headers={"X-Auth-Token": a.token}, timeout=10)
+        st = r.text
         m = __import__("re").search(r"wersja Pico ([^ |]+)", st)
         print(f"Obecna wersja Pico: {m.group(1) if m else '?'}")
     except requests.exceptions.RequestException:
@@ -832,7 +1144,16 @@ def aktualizuj_pico(a):
     time.sleep(25)
     for _ in range(30):
         try:
-            st = requests.get(f"{baza}/status", headers={"X-Auth-Token": a.token}, timeout=5).text
+            h = requests.get(f"{baza}/hello", headers={"Connection": "close"}, timeout=5)   # wersja bez logowania
+            m = re.search(r"wer=([^\s]+)", h.text) if h.status_code == 200 else None
+            if m:
+                print(f"[SUKCES] Pico dziala, wersja {m.group(1)}")
+                return
+            r = requests.get(f"{baza}/status", headers={"X-Auth-Token": a.token}, timeout=5)
+            if r.status_code == 401:                       # po restarcie Pico sesje przepadaja
+                zaloguj_ponownie(a, "Pico zrestartowalo sie - zaloguj sie ponownie:")
+                r = requests.get(f"{baza}/status", headers={"X-Auth-Token": a.token}, timeout=5)
+            st = r.text
             m = __import__("re").search(r"wersja Pico ([^ |]+)", st)
             print(f"[SUKCES] Pico dziala, wersja {m.group(1) if m else '?'}")
             return
@@ -852,11 +1173,19 @@ def wersja_z_opisu():
     return "?"
 
 
-def podpis_mtnod(wpisy, token):
+# Piasek (od 0.29): losowy kod przy kazdym przygotowaniu plikow; podpis kluczem token + ":" + piasek.
+# Alfabet bez znakow do pomylenia (0/O, 1/I/L, 2/Z, 5/S, 8/B).
+ALFABET_PIASKU = "ACDEFHJKMNPRTUVWXY3479"
+
+
+def podpis_mtnod(wpisy, token, piasek, czas):
     import hmac
-    tresc = "".join(f"{t}|{w[0]}|{w[2]}|{w[3]}" + (f"|{w[4]}" if len(w) > 4 and w[4] else "") + "\n"
+    tresc = "".join(f"{t}|{w[0]}|{w[2]}|{w[3]}" + (f"|{w[4]}" if len(w) > 4 and w[4] else "")
+                    + (f"|{w[5]}" if len(w) > 5 and w[5] else "") + "\n"
                     for t in ZNACZNIK_MTNOD if t in wpisy for w in [wpisy[t]])
-    return hmac.new(token.encode("utf-8"), tresc.encode("utf-8"), hashlib.sha256).hexdigest()
+    tresc += f"czas={czas}\n"
+    klucz = f"{token}:{piasek}"
+    return hmac.new(klucz.encode("utf-8"), tresc.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def przygotuj_serwer(a):
@@ -874,22 +1203,25 @@ def przygotuj_serwer(a):
         blad(f"Nie ma pliku {a.pico_fw}")
     os.makedirs(folder, exist_ok=True)
     mt = os.path.join(folder, "mtnod.txt")
+    import secrets
+    piasek = "".join(secrets.choice(ALFABET_PIASKU) for _ in range(6))   # tez klucz szyfrowania konfiguracji
     wpisy = {}                                              # typ -> (wersja, plik, rozmiar, crc)
     if os.path.isfile(mt):
         with open(mt, "r", encoding="utf-8") as fh:
             for l in fh:
                 l = l.strip()
-                if not l or l.startswith("#") or l.startswith("podpis="):
+                if not l or l.startswith("#") or l.startswith("podpis=") or l.startswith("czas="):
                     continue
                 p = l.split("|")
-                if len(p) in (5, 6) and p[0] in ZNACZNIK_MTNOD:
-                    wpisy[p[0]] = (p[1], p[2], p[3], p[4], p[5] if len(p) == 6 else "")
+                if len(p) in (5, 6, 7) and p[0] in ZNACZNIK_MTNOD:
+                    wpisy[p[0]] = (p[1], p[2], p[3], p[4], p[5] if len(p) >= 6 else "", p[6] if len(p) == 7 else "")
         print(f"Folder {folder} istnieje - podmieniam tylko podane czesci ({', '.join(wpisy) or 'brak wpisow'})\n")
 
     def zapisz(typ, nazwa, dane, wersja):
         with open(os.path.join(folder, nazwa), "wb") as fh:
             fh.write(dane)
-        wpisy[typ] = (wersja, nazwa, str(len(dane)), f"{zlib.crc32(dane) & 0xFFFFFFFF:08X}", WERSJA)
+        wpisy[typ] = (wersja, nazwa, str(len(dane)), f"{zlib.crc32(dane) & 0xFFFFFFFF:08X}", WERSJA,
+                      hashlib.sha256(dane).hexdigest())
         if typ != "pico" and len(dane) > LIMIT_PICO:
             print(f"[UWAGA] {nazwa}: {len(dane) // 1024} KB - wiecej niz miejsce na Pico (ok. {LIMIT_PICO // 1024} KB)!")
         elif typ != "pico" and len(dane) > LIMIT_PICO * 0.93:
@@ -904,6 +1236,9 @@ def przygotuj_serwer(a):
                 przygotuj_venv(a.venv, aktualizuj=not a.bez_aktualizacji, pre=a.pre)
             OPIS.clear()
             konfig = zbuduj_konfiguracje(a.config) if a.config else None
+            if konfig is not None:                          # na serwerze konfiguracja (klucze, PSK) tylko zaszyfrowana
+                konfig = szyfruj_konfig(konfig, a.token, piasek)
+                print("Konfiguracja w pakiecie zaszyfrowana (klucz z hasla strony i piasku)")
             print("\n=== pelna.mtpk ===")
             pakiet, _ = zbuduj_pakiet(a.firmware, ota_plik=a.ota, konfig=konfig)
             zapisz("pelna", "pelna.mtpk", pakiet, wersja_z_opisu())
@@ -938,43 +1273,70 @@ def przygotuj_serwer(a):
             blad("Ten plik to nie program Pico2W flasher (brak znacznika PICOVER) - Pico odrzuci go po pobraniu.")
         zapisz("pico", "pico.bin", obraz, wer)
 
+    # pakiet z zaszyfrowana konfiguracja z poprzedniego przygotowania ma klucz ze STAREGO piasku - nie do uzycia
+    if "pelna" in wpisy and not (a.firmware and os.path.basename(a.firmware).endswith(".factory.bin")):
+        try:
+            with open(os.path.join(folder, wpisy["pelna"][1]), "rb") as fh:
+                d = fh.read(12 + 64 * 8)
+            if any(struct.unpack_from("<I", d, 12 + 64 * i)[0] == CFGX_OFFSET for i in range(d[5])):
+                del wpisy["pelna"]
+                print("[UWAGA] pelna.mtpk ma konfiguracje zaszyfrowana starym piaskiem - usunieta z mtnod.txt."
+                      " Przygotuj ja ponownie (-f ...factory.bin -c ...).")
+        except (OSError, struct.error, IndexError):
+            pass
+    for t, w in wpisy.items():
+        if len(w) < 6 or not w[5]:
+            print(f"[UWAGA] {w[1]}: brak sumy SHA-256 (stare przygotowanie) - Pico {WERSJA} odrzuci, przygotuj ponownie")
+    czas = int(time.time())
     with open(mt, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(f"# mtnod.txt - wygenerowany {time.strftime('%Y-%m-%d %H:%M')} przez wyslij_firmware.py {WERSJA}\n")
-        fh.write("# typ|wersja|plik|rozmiar|crc32|wersja skryptu - pliki leza obok (mozna wpisac pelny adres https://...)\n")
+        fh.write("# typ|wersja|plik|rozmiar|crc32|wersja skryptu|sha256 - pliki leza obok (mozna wpisac pelny adres https://...)\n")
         fh.write("# Podpis obejmuje wszystko poza nazwa pliku. Nie zmieniaj tych pol recznie.\n")
         fh.write("# Pico przyjmuje pakiet wezla tylko ze skryptu w tej samej wersji co program Pico.\n")
         for t in ZNACZNIK_MTNOD:
             if t in wpisy:
                 w = wpisy[t]
-                fh.write("|".join((t,) + tuple(w[:4]) + ((w[4],) if w[4] else ())) + "\n")
-        fh.write(f"podpis={podpis_mtnod(wpisy, a.token)}\n")
+                fh.write("|".join((t,) + tuple(w[:4]) + ((w[4],) if w[4] else ()) + ((w[5],) if len(w) > 5 and w[5] else ())) + "\n")
+        fh.write(f"czas={czas}\n")
+        fh.write(f"podpis={podpis_mtnod(wpisy, a.token, piasek, czas)}\n")
 
     print(f"\nFolder: {os.path.abspath(folder)}")
     for t in ZNACZNIK_MTNOD:
         if t in wpisy:
-            w, plik, roz, crc, skr = wpisy[t]
+            w, plik, roz, crc, skr = wpisy[t][:5]
             print(f"  {plik:18s} {w:>12s} {int(roz) // 1024:>7} KB  CRC {crc}  skrypt {skr or '<0.24'}"
                   + ("  (Pico 0.24+ odrzuci - zbuduj ponownie)" if t != "pico" and skr != WERSJA else ""))
-    print("  mtnod.txt          podpisany tokenem" + (" DOMYSLNYM - zmien token w Pico i tutaj!" if a.token == DEFAULT_TOKEN else ""))
+    print("  mtnod.txt          podpisany tokenem" + (" DOMYSLNYM - zmien haslo w Pico!" if getattr(a, "haslo_domyslne", False) else ""))
     print("\nWgraj CALY folder na serwer WWW i wpisz w Pico adres mtnod.txt, np.:")
     print(f"  LoRa:  ADRES_URL:https://twoj-serwer/{os.path.basename(os.path.abspath(folder))}/mtnod.txt")
-    print("Potem LoRa:  " + "  albo  ".join(f"POBIERZ_INTERNET:{t}" for t in ZNACZNIK_MTNOD if t in wpisy) +
+    print("Potem LoRa:  " + "  albo  ".join(f"POBIERZ_INTERNET:{t}:{piasek}" for t in ZNACZNIK_MTNOD if t in wpisy) +
           "   a po potwierdzeniu   AKTUALIZUJ_INTERNET")
+    print("\n" + "=" * 60)
+    print(f"  PIASEK: {piasek}   <- ZAPISZ GO! Nie jest nigdzie zapisany.")
+    print("  Bez niego Pico odrzuci te pliki. Kazde przygotowanie plikow = nowy piasek")
+    print("  (starsze zestawy plikow Pico i tak odrzuca - znacznik czasu w podpisie).")
+    print("=" * 60)
 
 
 def pobierz_logi(a):
-    """Pobiera 3 logi z Pico (bez sprawdzania wersji - logi przydaja sie tez przy niezgodnosci)."""
+    """Pobiera 4 logi z Pico (bez sprawdzania wersji - logi przydaja sie tez przy niezgodnosci)."""
     import urllib.request
     folder = a.logi or time.strftime("logi_pico_%Y%m%d_%H%M")
     os.makedirs(folder, exist_ok=True)
     pliki = (("/download", "pico_log.txt", "log wezla (RAM)"),
              ("/download_pico", "pico_zdarzenia.txt", "zdarzenia Pico"),
-             ("/download_flash", "pico_log_flash.txt", "logi z flash"))
+             ("/download_flash", "pico_log_flash.txt", "logi z flash"),
+             ("/download_boot", "pico_starty_wezla.txt", "starty wezla"))
     bledy = 0
+    try:                                                  # wygasla sesja: zaloguj ponownie przed pobieraniem
+        if requests.get(f"http://{a.ip}/status", headers={"X-Auth-Token": a.token}, timeout=10).status_code == 401:
+            a.token = zapytaj_token(a.ip, "Sesja wygasla - zaloguj sie ponownie:")
+    except requests.exceptions.RequestException:
+        pass
     for sciezka, nazwa, opis in pliki:
         cel = os.path.join(folder, nazwa)
         try:
-            req = urllib.request.Request(f"http://{a.ip}{sciezka}", headers={"X-Auth-Token": a.token})
+            req = urllib.request.Request(f"http://{a.ip}{sciezka}", headers=podpisz("GET", sciezka, None, {"X-Auth-Token": a.token}))
             with urllib.request.urlopen(req, timeout=60) as r, open(cel, "wb") as fh:
                 n = 0
                 while True:
@@ -986,7 +1348,7 @@ def pobierz_logi(a):
         except Exception as e:
             bledy += 1
             kod = getattr(e, "code", None)
-            print(f"  {opis:18s} BLAD: {'zly token' if kod == 401 else 'Pico zajete (wgrywanie/odbior)' if kod == 503 else e}")
+            print(f"  {opis:18s} BLAD: {'brak sesji / zle haslo' if kod == 401 else 'Pico zajete (wgrywanie/odbior)' if kod == 503 else e}")
     if bledy == len(pliki):
         blad(f"Nie pobrano zadnego logu z {a.ip} (sprawdz polaczenie z Pico i --ip / --token)")
     print(f"\nLogi w folderze: {os.path.abspath(folder)}")
@@ -1001,11 +1363,22 @@ USTAWIENIA = {
     "BRAK_ODPOWIEDZI": ("brak_odp", "minuty bez odpowiedzi wezla (0 = wylaczone)"),
     "PIN_RESETU": ("rst_pin", "GP pinu resetu wezla (-1 = brak)"), "RESET_STAN": ("rst_hi", "stan aktywny pinu resetu"),
     "RESET_CZAS": ("rst_sek", "czas impulsu resetu (s)"),
-    "POWMAN_TIME": ("pm_time", "POWMAN pobudka: 0 / co h / godziny 6,18 / test 5m"),
+    "POWMAN_TIME": ("pm_time", "POWMAN pobudka: 0 / co h / godziny 6,18 / minuty 30m (min. 5m)"),
     "POWMAN_CZUWANIE": ("pm_czuw", "POWMAN czuwanie po pobudce (min)"),
+    "NAPIECIE_KOREKTA": ("v_kor", "korekta pomiaru napiecia VSYS (V, -1.00 do 1.00)"),
+    "NAPIECIE_PROG": ("v_prog", "prog ostrzezenia o niskim napieciu (V, 0 = wylaczony)"),
+    "TRYB_SIECI": ("net_mode", "tryb sieci: wifi / eth (W5500) / oba / brak (tylko LoRa)"),
+    "IPW": ("ipw", "staly adres Wi-Fi: ip/maska,brama[,dns], np. 192.168.1.40/24,192.168.1.1; - = DHCP"),
+    "IPE": ("ipe", "staly adres Ethernet W5500, format jak IPW; - = DHCP"),
+    "PORT_WEZLA": ("port_wezla", "port TCP 4403 do wezla (aplikacja / --host / VCOM, siec lokalna): 0 = wylaczony, 30m / 2h / 1d, max 7d"),
+    "IP_DOZWOLONE": ("ip_allow", "dozwolone IP w trybie STA, np. 192.168.1.98,192.168.1.* (puste = wszystkie)"),
     "KOMENDA_WLACZ": ("cmd_on", "komenda: wlacz Wi-Fi"), "KOMENDA_USPIJ": ("cmd_sleep", "komenda: uspij (Wi-Fi off)"),
     "KOMENDA_AP_WLACZ": ("cmd_ap_on", "komenda: staly AP wlacz"), "KOMENDA_AP_WYLACZ": ("cmd_ap_off", "komenda: staly AP wylacz"),
     "KOMENDA_TEMP": ("cmd_temp", "komenda: temperatura"),
+    "MODUL_ETH": ("eth_mod", "modul Ethernet: W5500 (mini, SPI1 GP8-13) / W5100S (HAT, SPI0 GP16-21)"),
+    "DEBUG_LOG_AUTO": ("log_api_auto", "security.debug_log_api_auto_enabled: TAK / NIE"),
+    "HOP": ("hop", "hop limit odpowiedzi LoRa Pico (0-7, domyslnie 3)"),
+    "STRONA": ("strona", "strona WWW w przegladarce: WL / WYL (skrypt dziala zawsze)"),
 }
 
 
@@ -1024,7 +1397,14 @@ def ustawienie_z_tekstu(t):
         w = w[1:-1]                                       # "wartosc ze spacjami"
     if klucz in ("AP_PWD", "STA_PWD") and not w:
         blad(f"{klucz}: puste haslo nie zmienia ustawienia - podaj 8-63 znaki")
-    if klucz == "MODE_WIFI":
+    if klucz == "PORT_WEZLA":
+        if not re.fullmatch(r"\d{1,6}[mhdMHD]?", w.strip()):
+            blad("PORT_WEZLA: podaj 0 albo czas np. 30m, 2h, 1d (max 7d)")
+    elif klucz == "TRYB_SIECI":
+        w = w.lower()
+        if w not in ("wifi", "eth", "oba", "brak"):
+            blad("TRYB_SIECI: podaj wifi, eth, oba albo brak")
+    elif klucz == "MODE_WIFI":
         if w.upper() not in ("AP", "STA"):
             blad("MODE_WIFI: podaj AP albo STA")
         w = "1" if w.upper() == "STA" else "0"
@@ -1054,6 +1434,19 @@ def ustawienie_z_tekstu(t):
             if len(ids) < 2 or len(ids) > 10:
                 blad("FILTR_NODE: podaj 2-10 wezlow albo * = wszyscy")
             w = ",".join(ids)
+    elif klucz == "MODUL_ETH":
+        m = {"W5500": "0", "MINI": "0", "0": "0", "W5100S": "1", "W5100": "1", "HAT": "1", "1": "1"}
+        if w.upper() not in m:
+            blad("MODUL_ETH: podaj W5500 albo W5100S")
+        w = m[w.upper()]
+    elif klucz in ("DEBUG_LOG_AUTO", "STRONA"):
+        m = {"TAK": "1", "WL": "1", "1": "1", "NIE": "0", "WYL": "0", "0": "0"}
+        if w.upper() not in m:
+            blad(f"{klucz}: podaj " + ("TAK albo NIE" if klucz == "DEBUG_LOG_AUTO" else "WL albo WYL"))
+        w = m[w.upper()]
+    elif klucz == "HOP":
+        if not (w.isdigit() and 0 <= int(w) <= 7):
+            blad("HOP: podaj 0-7")
     elif klucz.startswith("KOMENDA_"):
         w = w.upper()
     return klucz, pole, w
@@ -1062,7 +1455,7 @@ def ustawienie_z_tekstu(t):
 def ustawienia_pico(a):
     """--pokaz-ustawienia i --ustaw: odczyt / zmiana ustawien Pico przez /settings (jak panel strony)."""
     zapewnij_requests(a)
-    sprawdz_wersje_pico(a.ip, a.token)
+    sprawdz_wersje_pico(a.ip, a.token); a.token = globals().get("_TOKEN_OK", a.token)
     baza, nagl = f"http://{a.ip}", {"X-Auth-Token": a.token}
     if a.ustaw:
         zmiany = [ustawienie_z_tekstu(t) for t in a.ustaw]
@@ -1117,7 +1510,7 @@ def main():
     ap.add_argument("--pokaz-konfiguracje", nargs="?", const=True, metavar="PLIK",
                     help="tylko pokaz, co zostanie wyslane (nic nie wysyla); plik mozna podac tu albo przez -c")
     ap.add_argument("--ip", default=DEFAULT_IP, help=f"adres Pico (domyslnie {DEFAULT_IP})")
-    ap.add_argument("--token", default=DEFAULT_TOKEN, help="haslo/token Pico (to samo co do strony; domyslne MojeBezpieczneHaslo123)")
+    ap.add_argument("--token", default=None, help="haslo Pico (to samo co do strony); bez --token skrypt pyta i pamieta tylko sesje (30 min)")
     ap.add_argument("--tylko-wyslij", action="store_true", help="tylko wyslij pakiet, bez flashowania")
     ap.add_argument("--tylko-factory", action="store_true",
                     help="factory.bin bez kasowania calego flasha (czysci NVS) - wymaga -c PLIK z konfiguracja")
@@ -1131,10 +1524,13 @@ def main():
     ap.add_argument("--przyklady", action="store_true", help="pokaz przyklady uzycia, tryby i wymagane pliki")
     ap.add_argument("--restart-pico", action="store_true", help="zrestartuj Pico (wymaga tokenu) i zakoncz")
     ap.add_argument("--pokaz-ustawienia", action="store_true", help="pokaz ustawienia Pico (bez hasel i tokenu)")
+    ap.add_argument("--pico-id", metavar="ID", help="identyfikator Pico (12 znakow) - sol z pamieci skryptu, bez polaczenia z Pico")
+    ap.add_argument("--sol", help="sol hasla Pico (32 znaki hex) do --przygotuj-serwer bez polaczenia z Pico; "
+                                  "odczyt: strona Pico (u gory), LoRa SOL albo --pokaz-ustawienia")
     ap.add_argument("--ustaw", action="append", metavar="KLUCZ=WARTOSC",
                     help="zmien ustawienie Pico (mozna kilka razy), np. --ustaw BRAK_ODPOWIEDZI=30; lista kluczy: --przyklady")
     ap.add_argument("--logi", nargs="?", const="", metavar="FOLDER",
-                    help="pobierz z Pico 3 logi (log wezla z RAM, zdarzenia Pico, logi z flash) do FOLDER "
+                    help="pobierz z Pico 4 logi (log wezla z RAM, zdarzenia Pico, logi z flash, 2 ostatnie starty wezla) do FOLDER "
                          "(domyslnie nowy folder logi_pico_RRRRMMDD_GGMM) i zakoncz")
     ap.add_argument("--pico-fw", metavar="PLIK.bin",
                     help="aktualizacja programu Pico przez Wi-Fi (plik .bin z Arduino IDE: Szkic -> Eksportuj skompilowany plik)")
@@ -1172,6 +1568,40 @@ def main():
     if a.przyklady:
         print(__doc__.split("TRYBY", 1)[1].join(["TRYBY", ""]) if "TRYBY" in __doc__ else __doc__)
         return
+    if a.przygotuj_serwer:
+        haslo = haslo_lokalne(a)                          # podpis mtnod.txt skrotem hasla, bez logowania do Pico
+        a.haslo_domyslne = haslo == DEFAULT_TOKEN
+        zapewnij_requests(a)
+        if a.sol and not re.fullmatch(r"[0-9a-fA-F]{32}", a.sol):
+            blad("--sol: oczekiwane 32 znaki hex (np. z LoRa SOL albo ze strony Pico)")
+        ip_podane = any(x == "--ip" or x.startswith("--ip=") for x in sys.argv)
+        if a.pico_id and not re.fullmatch(r"[0-9a-fA-F]{12}", a.pico_id):
+            blad("--pico-id: identyfikator Pico to 12 znakow hex (strona Pico u gory, LoRa SOL)")
+        sol = None
+        if ip_podane or not (a.sol or a.pico_id):            # samo --sol / --pico-id: bez kontaktu z Pico
+            sol, _ = pobierz_sol(a.ip)                    # Pico osiagalne -> jego sol jest najpewniejsza
+        if sol and a.sol and a.sol.lower() != sol:
+            print(f"[UWAGA] --sol rozni sie od soli w Pico {a.ip} - uzywam soli z Pico (haslo zmienione?)")
+        if sol and a.pico_id and id_dla(a.ip) != a.pico_id.lower():
+            blad(f"Pod {a.ip} odpowiada Pico {id_dla(a.ip)}, a podano --pico-id {a.pico_id} - sprawdz adres")
+        zrodlo = "z Pico" if sol else ("z --sol" if a.sol else "zapamietana")
+        sol = sol or (a.sol.lower() if a.sol else None) or (sol_pico(a.pico_id) if a.pico_id else sol_dla(a.ip))
+        if not sol:
+            znane = ", ".join(_sesje().get("_sol", {})) or "brak"
+            blad(f"Brak soli hasla{' dla Pico ' + a.pico_id if a.pico_id else ''}. Znane Pico: {znane}. "
+                 "Podaj --pico-id ID albo --sol XXXX (LoRa: SOL, albo strona Pico u gory po zalogowaniu).")
+        a.token = skrot_hasla(haslo, sol).hex()           # Pico od 0.40 sprawdza podpis skrotem hasla
+        if ip_podane or not (a.sol or a.pico_id):
+            zapamietaj_sesje(a.ip, sesja_dla(a.ip) or "", sol)
+        pid = a.pico_id.lower() if a.pico_id else (id_dla(a.ip) if (ip_podane or not a.sol) else None)
+        if a.sol and not pid:                             # samo --sol: Pico o tej soli z pamieci skryptu
+            pid = next((i for i, x in _sesje().get("_sol", {}).items() if x == sol), None)
+        if a.sol and a.pico_id and sol_pico(a.pico_id) != sol:  # --pico-id + --sol: zapamietaj na nastepne razy
+            zapamietaj_sol(a.pico_id.lower(), sol)
+            print(f"Zapamietano sol dla Pico {a.pico_id.lower()} - nastepnym razem wystarczy --pico-id {a.pico_id.lower()}")
+        print(f"Pico {pid or '?'}, sol hasla ({zrodlo}): {sol}")
+    elif not (a.pokaz_konfiguracje or (a.zapisz and not a.tylko_wyslij)):   # polecenia lokalne nie potrzebuja hasla
+        ustal_token(a)
 
     if a.logi is not None and (a.przygotuj_serwer or a.pico_fw or a.restart_pico or a.zapisz or a.tylko_wyslij
                                or a.pokaz_konfiguracje or a.ustaw or a.pokaz_ustawienia):
@@ -1193,6 +1623,8 @@ def main():
         if a.firmware or a.pico_fw or a.przygotuj_serwer or a.wyslij_pakiet or a.tylko_konfiguracja or a.restart_pico:
             blad("--ustaw / --pokaz-ustawienia uzywaj osobno")
         ustawienia_pico(a)
+        if sol_dla(a.ip):
+            print(f"Pico {id_dla(a.ip) or '?'}, sol hasla: {sol_dla(a.ip)}   (--pico-id ID albo --sol; sol zmienia sie przy zmianie hasla)")
         return
 
     if a.restart_pico:
@@ -1277,7 +1709,7 @@ def main():
 
     baza = f"http://{a.ip}"
     czekaj_na_pico(a.ip)
-    sprawdz_wersje_pico(a.ip, a.token)
+    sprawdz_wersje_pico(a.ip, a.token); a.token = globals().get("_TOKEN_OK", a.token)
     crc_juz = ""
     try:
         crc_juz = requests.get(f"{baza}/pkg_crc", headers={"X-Auth-Token": a.token}, timeout=10).text.strip().upper()
@@ -1317,13 +1749,35 @@ def main():
 
     ostatni = ""
     t0 = time.time()
+    cisza_od = None                                     # od kiedy Pico nie odpowiada
+    po_restarcie = None                                 # od kiedy Pico wrocilo po restarcie
     while time.time() - t0 < 20 * 60:
         time.sleep(2)
         try:
-            stan = requests.get(f"{baza}/fw_status", headers={"X-Auth-Token": a.token}, timeout=10).text.strip()
+            r = requests.get(f"{baza}/fw_status", headers={"X-Auth-Token": a.token}, timeout=10)
         except requests.exceptions.RequestException:
-            print("      (brak odpowiedzi Pico, ponawiam...)")
+            if cisza_od is None:
+                cisza_od = time.time()
+                print("      (Pico nie odpowiada - restart albo zanik zasilania? czekam do 5 min; "
+                      "Pico samo wznowi przerwany etap)")
+            elif time.time() - cisza_od > 300:
+                blad("Pico nie odpowiada od 5 min. Sprawdz zasilanie i siec; po powrocie Pico samo wznowi przerwany etap "
+                     "(do 3 prob) - postep widac na stronie Pico i w raporcie LoRa.")
             continue
+        if cisza_od is not None:
+            print(f"      (Pico znow odpowiada po {time.time() - cisza_od:.0f} s)")
+            cisza_od = None
+        if r.status_code == 401:                         # sesje sa w RAM Pico - po restarcie trzeba sie zalogowac
+            print("      Pico zrestartowalo sie (sesja wygasla) - loguje ponownie i sledze wznowienie...")
+            po_restarcie = time.time()
+            zaloguj_ponownie(a, "Pico zrestartowalo sie w trakcie - zaloguj sie, zeby sledzic wznowienie:")
+            continue
+        stan = r.text.strip()
+        if stan.startswith("TRWA|"):
+            po_restarcie = None
+        elif stan.startswith("BRAK|") and po_restarcie and time.time() - po_restarcie > 90:
+            blad("Pico po restarcie nie wznowilo flashowania (brak wpisu w dzienniku etapow albo brak pakietu). "
+                 "Sprawdz 'Zdarzenia Pico' na stronie i uruchom wgrywanie ponownie.")
         if stan != ostatni:
             czesci = stan.split("|", 2)
             if len(czesci) == 3:
