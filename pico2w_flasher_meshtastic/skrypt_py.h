@@ -2,10 +2,11 @@
 // Wygenerowane automatycznie z wyslij_firmware.py - nie edytowac recznie.
 // Plik musi lezec w folderze szkicu obok pico2w_flasher_meshtastic.ino.
 #pragma once
-#define SKRYPT_PY_WERSJA "0.40"
+#define SKRYPT_PY_WERSJA "0.41"
 static const char SKRYPT_PY[] = R"PYSKRYPT(#!/usr/bin/env python3
 """
 wyslij_firmware.py - pomyslodawca projektu: Rafal Cichosz (rpc)
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 Wysyla firmware Meshtastic (i opcjonalnie konfiguracje) do Pico 2 W, ktore wgrywa je do wezla ESP32-S3 przez USB.
 Pliki pomocnicze (.mt.json, mt-<mcu>-ota.bin, littlefs-*.bin) sa brane z folderu podanego pliku firmware.
@@ -105,7 +106,7 @@ USTAWIENIA PICO (od 0.26; wszystko oprocz tokenu - token zmieniasz tylko na stro
   NAPIECIE_KOREKTA (V, np. 0.25), NAPIECIE_PROG (V, 0 = wylaczony, np. 4.60),
   IP_DOZWOLONE (np. 192.168.1.98,192.168.1.*; puste = wszystkie; tylko tryb STA),
   TRYB_SIECI (wifi / eth / oba / brak), MODUL_ETH (W5500 / W5100S), HOP (0-7), STRONA (WL / WYL),
-  DEBUG_LOG_AUTO (TAK / NIE), PORT_WEZLA (0 / 30m / 2h / 1d, max 7d - port TCP 4403 do wezla, tylko siec lokalna),
+  DEBUG_LOG_AUTO (TAK / NIE), ZASOBY_LORA (TAK / NIE), PORT_WEZLA (0 / 30m / 2h / 1d, max 7d - port TCP 4403 do wezla, tylko siec lokalna),
   IPW, IPE (staly adres Wi-Fi / Ethernet, jak w LoRa:
   ip/maska,brama[,dns] np. 192.168.1.40/24,192.168.1.1; - = DHCP), KOMENDA_WLACZ, KOMENDA_USPIJ, KOMENDA_AP_WLACZ,
   KOMENDA_AP_WYLACZ, KOMENDA_TEMP. Separator '=' albo ':' (pierwszy w tekscie, jak w komendach LoRa).
@@ -135,7 +136,7 @@ try:
 except ImportError:
     requests = None             # zostanie doinstalowane w srodowisku venv
 
-WERSJA = "0.40"
+WERSJA = "0.41"
 DEFAULT_IP = "192.168.4.1"
 DEFAULT_TOKEN = "MojeBezpieczneHaslo123"
 # Wlasne srodowisko w podfolderze obok skryptu - niezalezne od starej wersji z pakietow Debiana
@@ -1377,6 +1378,7 @@ USTAWIENIA = {
     "KOMENDA_TEMP": ("cmd_temp", "komenda: temperatura"),
     "MODUL_ETH": ("eth_mod", "modul Ethernet: W5500 (mini, SPI1 GP8-13) / W5100S (HAT, SPI0 GP16-21)"),
     "DEBUG_LOG_AUTO": ("log_api_auto", "security.debug_log_api_auto_enabled: TAK / NIE"),
+    "ZASOBY_LORA": ("zas_lora", "ostrzezenia zasobow przez LoRa: TAK / NIE"),
     "HOP": ("hop", "hop limit odpowiedzi LoRa Pico (0-7, domyslnie 3)"),
     "STRONA": ("strona", "strona WWW w przegladarce: WL / WYL (skrypt dziala zawsze)"),
 }
@@ -1439,10 +1441,10 @@ def ustawienie_z_tekstu(t):
         if w.upper() not in m:
             blad("MODUL_ETH: podaj W5500 albo W5100S")
         w = m[w.upper()]
-    elif klucz in ("DEBUG_LOG_AUTO", "STRONA"):
+    elif klucz in ("DEBUG_LOG_AUTO", "ZASOBY_LORA", "STRONA"):
         m = {"TAK": "1", "WL": "1", "1": "1", "NIE": "0", "WYL": "0", "0": "0"}
         if w.upper() not in m:
-            blad(f"{klucz}: podaj " + ("TAK albo NIE" if klucz == "DEBUG_LOG_AUTO" else "WL albo WYL"))
+            blad(f"{klucz}: podaj " + ("WL albo WYL" if klucz == "STRONA" else "TAK albo NIE"))
         w = m[w.upper()]
     elif klucz == "HOP":
         if not (w.isdigit() and 0 <= int(w) <= 7):
@@ -1492,6 +1494,12 @@ def ustawienia_pico(a):
             w = "0 (wylaczone)"
         elif k == "PIN_RESETU":
             w = "-1 (brak)" if w == "-1" else f"GP{w}"
+        elif k == "MODUL_ETH":
+            w = "W5100S (HAT)" if w == "1" else "W5500 (mini)"
+        elif k in ("DEBUG_LOG_AUTO", "ZASOBY_LORA"):
+            w = "TAK" if w == "1" else "NIE"
+        elif k == "STRONA":
+            w = "WL" if w == "1" else "WYL"
         print(f"  {k:18s} {w or '(puste)':30s} {opis}")
     print("\nZmiana: --ustaw KLUCZ=WARTOSC (mozna kilka razy w jednym poleceniu)")
 

@@ -1,5 +1,6 @@
 // =========================================================================
 // Pomyslodawca projektu: Rafal Cichosz (rpc)
+// Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 // Pico 2 W jako host USB dla wezlow Meshtastic ESP32-S3 (np. Heltec V4, XIAO ESP32-S3)
 //   - podgląd logów w przeglądarce (Wi-Fi AP)
 //   - reset / bootloader przez DTR/RTS
@@ -81,7 +82,7 @@ struct Settings { String picoId, apSsid, apPass, tokSol, tokHash, staSsid, staPa
                   float vKor, vProg;
                   String ipAllow;
                   uint32_t dgDo, mtCzas;
-                  String netMode; int ethMod; bool logApiAuto; bool strona; int hop;                  // tryb sieci: "wifi" (domyslnie) albo "brak" (Wi-Fi wylaczone; awaryjnie LoRa)
+                  String netMode; int ethMod; bool logApiAuto; bool strona; int hop; bool zasLora;                  // tryb sieci: "wifi" (domyslnie) albo "brak" (Wi-Fi wylaczone; awaryjnie LoRa)
                   String staIp, staMask, staGw, staDns;
                   String ethIp, ethMask, ethGw, ethDns;
                   String fwOst; } cfg;                 // fwOst: ostatnia znana wersja firmware wezla (anti-rollback, gdy API nie odpowiada)   // staly adres w trybie STA (staIp puste = DHCP)     // dgDo: downgrade dozwolony do (unix); mtCzas: czas ostatniego przyjetego mtnod.txt              // ipAllow: dozwolone adresy klientow w trybie STA (puste = wszystkie)          // VSYS: korekta pomiaru (V) i prog ostrzezenia (V, 0 = wylaczony)   // POWMAN: "0" / "12" (co 12 h) / "6,18" (o godzinach) / "5m" (test); czuwanie min
@@ -325,7 +326,7 @@ static volatile int etapStart = 0, etapStartProba = 0; static volatile bool etap
 static const uint32_t CFG_BOOT_WAIT_MS = 60000;    // pierwszy start wezla: klucze, zapis plikow, GPS, BT
 static const uint32_t CFG_RETRY_WAIT_MS = 30000;   // przed ponowieniem konfiguracji
 static const uint32_t ACK_TIMEOUT_MS = 8000;       // np. zmiana regionu LoRa przestawia radio - trwa
-#define PICO_VER "0.40"
+#define PICO_VER "0.41"
 #include "skrypt_py.h"                               // wyslij_firmware.py do pobrania ze strony
 constexpr bool verEq(const char* a, const char* b) { return *a == *b && (*a == 0 || verEq(a + 1, b + 1)); }
 static_assert(verEq(SKRYPT_PY_WERSJA, PICO_VER),
@@ -1680,6 +1681,7 @@ TRWA ODBIOR PAKIETU FIRMWARE - strona nie odpytuje Pico, zeby nie przeszkadzac. 
  <tr><td>Haslo AP (12-63)</td><td><input id="sApP" type="password" maxlength="63"></td></tr>
  <tr><td>Haslo AP - powtorz</td><td><input id="sApP2" type="password" maxlength="63"></td></tr>
  <tr><td>Tryb sieci</td><td><select id="sNet"><option value="wifi">Wi-Fi (wg trybu AP/STA)</option><option value="eth">Ethernet (Wi-Fi wylaczone; bez modulu - Wi-Fi awaryjnie)</option><option value="oba">oba - Wi-Fi i Ethernet</option><option value="brak">brak - Wi-Fi wylaczone (tylko LoRa)</option></select></td></tr>
+ <tr><td>Ostrzezenia zasobow przez LoRa</td><td><select id="sZl"><option value="1">tak - alarm (malo RAM, wyciek, przeciazenie, malo flasha) idzie na kanal komend</option><option value="0">nie - tylko wpis w zdarzeniach (stan: komenda ZASOBY)</option></select></td></tr>
  <tr><td>security.debug_log_api_auto_enabled</td><td><select id="sLa"><option value="1">tak - Pico sam wlacza debug_log_api_enabled w wezle (logi plyna tez w trybie API; jednorazowy restart wezla)</option><option value="0">nie</option></select></td></tr>
  <tr><td>Modul Ethernet</td><td><select id="sEm"><option value="0">W5500-mini (SPI1: GP8-13)</option><option value="1">WIZnet Ethernet HAT W5100S (SPI0: GP16-21)</option></select></td></tr>
  <tr><td>Siec STA (SSID)</td><td><input id="sStS" maxlength="32"></td></tr>
@@ -1923,7 +1925,7 @@ function flashBtn(){
   else
     act('Wgrac pakiet z Pico (tryb: ' + (pkgTryb || 'nieznany') + ')?','/fw_flash');
 }
-let setOn=false, rstFiz='GP15 (pin 20)', rstSek=5;
+let setOn=false, rstFiz='GP22 (pin 29)', rstSek=5;
 async function rstLabel(){ try{
   const t=await (await F('/settings')).text(), v={};
   t.split('\n').forEach(l=>{const i=l.indexOf('='); if(i>0) v[l.substring(0,i)]=l.substring(i+1);});
@@ -1944,7 +1946,7 @@ async function togSet(){
   document.getElementById('sRs').value=v.rst_sek||'5'; document.getElementById('sRh').value=v.rst_hi||'1';
   document.getElementById('sPmT').value=v.pm_time||'0'; document.getElementById('sPmC').value=v.pm_czuw||'30';
   document.getElementById('sIpA').value=v.ip_allow||'';
-  document.getElementById('sNet').value=v.net_mode||'wifi'; document.getElementById('sEm').value=v.eth_mod||'0'; document.getElementById('sLa').value=v.log_api_auto||'1';
+  document.getElementById('sNet').value=v.net_mode||'wifi'; document.getElementById('sEm').value=v.eth_mod||'0'; document.getElementById('sLa').value=v.log_api_auto||'1'; document.getElementById('sZl').value=v.zas_lora||'1';
   document.getElementById('sEip').value=v.eth_ip||''; document.getElementById('sEmk').value=v.eth_mask||''; document.getElementById('sEgw').value=v.eth_gw||''; document.getElementById('sEdn').value=v.eth_dns||'';
   document.getElementById('sSip').value=v.sta_ip||''; document.getElementById('sSmk').value=v.sta_mask||'';
   document.getElementById('sSgw').value=v.sta_gw||''; document.getElementById('sSdn').value=v.sta_dns||'';
@@ -1962,7 +1964,7 @@ async function zapiszUst(){
   if(g('sTok')!=g('sTok2')){ alert('Haslo strony (token): oba pola musza byc takie same'); return; }
   if(g('sApP')!=g('sApP2')){ alert('Haslo AP: oba pola musza byc takie same'); return; }
   if(!confirm('Zapisac ustawienia i zrestartowac Pico?'+(sta=='1'?'\nPico przejdzie w tryb STA - strona bedzie pod innym adresem.':''))) return;
-  const b=new URLSearchParams({ap_ssid:g('sApS'),ap_pass:g('sApP'),sta:sta,sta_ssid:g('sStS'),sta_pass:g('sStP'),ch:g('sCh'),senders:g('sSnd'),url:g('sUrl'),brak_odp:g('sOdp'),rst_pin:g('sRp'),rst_sek:g('sRs'),rst_hi:g('sRh'),pm_time:g('sPmT'),pm_czuw:g('sPmC'),v_kor:g('sVk'),v_prog:g('sVp'),ip_allow:g('sIpA'),net_mode:g('sNet'),eth_mod:g('sEm'),log_api_auto:g('sLa'),hop:g('sHop'),strona:g('sStr'),sta_ip:g('sSip'),sta_mask:g('sSmk'),sta_gw:g('sSgw'),sta_dns:g('sSdn'),eth_ip:g('sEip'),eth_mask:g('sEmk'),eth_gw:g('sEgw'),eth_dns:g('sEdn'),
+  const b=new URLSearchParams({ap_ssid:g('sApS'),ap_pass:g('sApP'),sta:sta,sta_ssid:g('sStS'),sta_pass:g('sStP'),ch:g('sCh'),senders:g('sSnd'),url:g('sUrl'),brak_odp:g('sOdp'),rst_pin:g('sRp'),rst_sek:g('sRs'),rst_hi:g('sRh'),pm_time:g('sPmT'),pm_czuw:g('sPmC'),v_kor:g('sVk'),v_prog:g('sVp'),ip_allow:g('sIpA'),net_mode:g('sNet'),eth_mod:g('sEm'),log_api_auto:g('sLa'),zas_lora:g('sZl'),hop:g('sHop'),strona:g('sStr'),sta_ip:g('sSip'),sta_mask:g('sSmk'),sta_gw:g('sSgw'),sta_dns:g('sSdn'),eth_ip:g('sEip'),eth_mask:g('sEmk'),eth_gw:g('sEgw'),eth_dns:g('sEdn'),
     cmd_on:g('c0'),cmd_sleep:g('c1'),cmd_ap_on:g('c2'),cmd_ap_off:g('c3'),cmd_temp:g('c4')});
   if(g('sTok')){ if(g('sTok').length<12){ alert('Haslo strony: min. 12 znakow'); return; }
     try{ const nt=nowyTok(g('sTok')); for(const k in nt) b.set(k,nt[k]); }catch(x){ alert(x.message); return; } }
@@ -2636,8 +2638,8 @@ void loadSettings() {
   cfg.apSsid = DEF_AP_SSID; cfg.apPass = DEF_AP_PASS; cfg.tokSol = cfg.tokHash = ""; cfg.tokSlabe = true;
   String tokJawny;                                     // do 0.39 haslo bylo zapisane jawnie - zamiana na skrot
   cfg.staSsid = ""; cfg.staPass = ""; cfg.sta = false; cfg.ch = 1; cfg.senders = ""; cfg.url = ""; cfg.logOn = true;
-  cfg.brakOdp = 0; cfg.rstPin = 15; cfg.rstSek = 5; cfg.rstHigh = true;
-  cfg.pmTime = "0"; cfg.pmCzuw = 30; cfg.vKor = 0; cfg.vProg = 0; cfg.ipAllow = ""; cfg.dgDo = 0; cfg.mtCzas = 0; cfg.netMode = "wifi"; cfg.ethMod = 0; cfg.logApiAuto = true; cfg.strona = true; cfg.hop = 3; cfg.staIp = cfg.staMask = cfg.staGw = cfg.staDns = "";
+  cfg.brakOdp = 0; cfg.rstPin = 22; cfg.rstSek = 5; cfg.rstHigh = true;
+  cfg.pmTime = "0"; cfg.pmCzuw = 30; cfg.vKor = 0; cfg.vProg = 0; cfg.ipAllow = ""; cfg.dgDo = 0; cfg.mtCzas = 0; cfg.netMode = "wifi"; cfg.ethMod = 0; cfg.logApiAuto = true; cfg.zasLora = true; cfg.strona = true; cfg.hop = 3; cfg.staIp = cfg.staMask = cfg.staGw = cfg.staDns = "";
   cfg.ethIp = cfg.ethMask = cfg.ethGw = cfg.ethDns = ""; cfg.fwOst = ""; cfg.picoId = "";
   for (int i = 0; i < 5; i++) cfg.cmd[i] = CMD_DEF[i];
   File f = LittleFS.open(SETTINGS_PATH, "r");
@@ -2673,6 +2675,7 @@ void loadSettings() {
     else if (k == "mt_czas") cfg.mtCzas = strtoul(v.c_str(), nullptr, 10);
     else if (k == "eth_mod") cfg.ethMod = v.toInt() == 1 ? 1 : 0;
     else if (k == "log_api_auto") cfg.logApiAuto = (v != "0");
+    else if (k == "zas_lora") cfg.zasLora = (v != "0");
     else if (k == "strona") cfg.strona = (v != "0");
     else if (k == "hop") cfg.hop = constrain(v.toInt(), 0, 7);
     else if (k == "net_mode") cfg.netMode = (v == "brak" || v == "eth" || v == "oba") ? v : String("wifi");
@@ -2707,7 +2710,7 @@ bool saveSettings() {
   f.printf("v_kor=%.2f\nv_prog=%.2f\n", cfg.vKor, cfg.vProg);
   f.printf("ip_allow=%s\n", cfg.ipAllow.c_str());
   f.printf("dg_do=%lu\nmt_czas=%lu\n", (unsigned long)cfg.dgDo, (unsigned long)cfg.mtCzas);
-  f.printf("eth_mod=%d\nlog_api_auto=%d\nstrona=%d\nhop=%d\n", cfg.ethMod, cfg.logApiAuto ? 1 : 0, cfg.strona ? 1 : 0, cfg.hop);
+  f.printf("eth_mod=%d\nlog_api_auto=%d\nzas_lora=%d\nstrona=%d\nhop=%d\n", cfg.ethMod, cfg.logApiAuto ? 1 : 0, cfg.zasLora ? 1 : 0, cfg.strona ? 1 : 0, cfg.hop);
   f.printf("net_mode=%s\nsta_ip=%s\nsta_mask=%s\nsta_gw=%s\nsta_dns=%s\n", cfg.netMode.c_str(), cfg.staIp.c_str(),
            cfg.staMask.c_str(), cfg.staGw.c_str(), cfg.staDns.c_str());
   f.printf("eth_ip=%s\neth_mask=%s\neth_gw=%s\neth_dns=%s\nfw_ost=%s\n", cfg.ethIp.c_str(), cfg.ethMask.c_str(), cfg.ethGw.c_str(), cfg.ethDns.c_str(), cfg.fwOst.c_str());
@@ -2721,7 +2724,7 @@ void handleSettingsGet() {      // hasel nie odsylamy
               "\n" + CMD_KEYS[3] + "=" + cfg.cmd[3] + "\n" + CMD_KEYS[4] + "=" + cfg.cmd[4] + "\n" +
               "brak_odp=" + cfg.brakOdp + "\nrst_pin=" + cfg.rstPin + "\nrst_sek=" + cfg.rstSek + "\nrst_hi=" + (cfg.rstHigh ? "1" : "0") + "\n" +
               "pm_time=" + cfg.pmTime + "\npm_czuw=" + cfg.pmCzuw + "\npm_on=" + (pmActive() ? "1" : "0") + "\n" +
-              "v_kor=" + String(cfg.vKor, 2) + "\nv_prog=" + String(cfg.vProg, 2) + "\nip_allow=" + cfg.ipAllow + "\nnet_mode=" + cfg.netMode + "\neth_mod=" + String(cfg.ethMod) + "\nlog_api_auto=" + (cfg.logApiAuto ? "1" : "0") + "\nhop=" + String(cfg.hop) + "\nstrona=" + (cfg.strona ? "1" : "0") +
+              "v_kor=" + String(cfg.vKor, 2) + "\nv_prog=" + String(cfg.vProg, 2) + "\nip_allow=" + cfg.ipAllow + "\nnet_mode=" + cfg.netMode + "\neth_mod=" + String(cfg.ethMod) + "\nlog_api_auto=" + (cfg.logApiAuto ? "1" : "0") + "\nzas_lora=" + (cfg.zasLora ? "1" : "0") + "\nhop=" + String(cfg.hop) + "\nstrona=" + (cfg.strona ? "1" : "0") +
               "\nsta_ip=" + cfg.staIp + "\nsta_mask=" + cfg.staMask + "\nsta_gw=" + cfg.staGw + "\nsta_dns=" + cfg.staDns +
               "\neth_ip=" + cfg.ethIp + "\neth_mask=" + cfg.ethMask + "\neth_gw=" + cfg.ethGw + "\neth_dns=" + cfg.ethDns +
               "\nipw=" + ipTxt(cfg.staIp, cfg.staMask, cfg.staGw, cfg.staDns) + "\nipe=" + ipTxt(cfg.ethIp, cfg.ethMask, cfg.ethGw, cfg.ethDns) + "\nport_wezla=" + brTxt() + "\n");
@@ -2765,6 +2768,7 @@ void handleSettingsPost() {
   if (server.hasArg("net_mode")) n.netMode = server.arg("net_mode");
   if (server.hasArg("eth_mod"))  n.ethMod = server.arg("eth_mod") == "1" ? 1 : 0;
   if (server.hasArg("log_api_auto")) n.logApiAuto = server.arg("log_api_auto") != "0";
+  if (server.hasArg("zas_lora")) n.zasLora = server.arg("zas_lora") != "0";
   if (server.hasArg("hop")) n.hop = constrain(server.arg("hop").toInt(), 0, 7);
   if (server.hasArg("strona")) n.strona = server.arg("strona") != "0";   // strona (pole Strona WWW) i skrypt (--ustaw STRONA=WYL)
   if (server.hasArg("sta_ip"))   { n.staIp = server.arg("sta_ip"); n.staIp.trim(); }
@@ -2818,8 +2822,8 @@ void handleSettingsPost() {
     if (n.cmd[i].length() < 3 || n.cmd[i].length() > 20 || n.cmd[i].indexOf(' ') >= 0 ||
         n.cmd[i].indexOf(':') >= 0 || n.cmd[i].indexOf('=') >= 0) err = "Komenda: 3-20 znakow, bez spacji, ':' i '='";
     if (n.cmd[i] == "HELP" || n.cmd[i] == "WERSJE" || n.cmd[i] == "AKTUALIZUJ_INTERNET" || n.cmd[i] == "USPIJ_POWMAN" ||
-        n.cmd[i] == "RESTART_PICO" || n.cmd[i] == "DOWNGRADE" || n.cmd[i] == "PORT_WEZLA" || n.cmd[i] == "SOL" || n.cmd[i] == "STRONA")
-      err = "Nazwy HELP, WERSJE, AKTUALIZUJ_INTERNET, USPIJ_POWMAN, RESTART_PICO, DOWNGRADE, PORT_WEZLA, SOL i STRONA sa zarezerwowane";
+        n.cmd[i] == "RESTART_PICO" || n.cmd[i] == "DOWNGRADE" || n.cmd[i] == "PORT_WEZLA" || n.cmd[i] == "SOL" || n.cmd[i] == "STRONA" || n.cmd[i] == "ZASOBY")
+      err = "Nazwy HELP, WERSJE, AKTUALIZUJ_INTERNET, USPIJ_POWMAN, RESTART_PICO, DOWNGRADE, PORT_WEZLA, SOL, STRONA i ZASOBY sa zarezerwowane";
     for (int j = 0; j < i; j++) if (n.cmd[i] == n.cmd[j]) err = "Komendy musza byc rozne";
   }
   if (err.length()) { server.send(400, "text/plain", err); return; }
@@ -3751,15 +3755,90 @@ static void petlaTik(int c) {
   if (t - p.okno >= 5000000) { p.hz = (uint32_t)((uint64_t)p.n * 1000000 / (t - p.okno)); p.maxUs = p.mx; p.n = 0; p.mx = 0; p.okno = t;
     if (c == 0) { uint32_t w = rp2040.getFreeHeap(); if (w < ramMinWolne) ramMinWolne = w; } }
 }
+// Kontrola zasobow (od 0.41): rekordy od startu (poza operacjami na firmware), proba RAM co godzine w spoczynku,
+// ostrzezenia w zdarzeniach i przez LoRa (kazdy rodzaj najwyzej raz na 24 h). Progi stale - bez dodatkowych ustawien.
+static const uint32_t ZAS_RAM_PROG = 30 * 1024;         // wolny RAM ponizej - ostrzezenie
+static const uint32_t ZAS_WYCIEK = 16 * 1024;           // spadek wolnego RAM w spoczynku przez 6 h (co godzine coraz mniej)
+static const uint32_t ZAS_PETLA0_MS = 5000, ZAS_PETLA1_MS = 1000;   // najdluzszy obieg petli: rdzen 0 (siec, strona), rdzen 1 (USB)
+static const uint32_t ZAS_FLASH_PROG = 48 * 1024;       // wolne miejsce LittleFS ponizej - ostrzezenie
+static uint32_t zasRek[2] = {0, 0};                     // najdluzszy obieg petli od startu [us]
+static uint32_t zasRam10 = 0;                           // wolny RAM 10 min po starcie
+static uint32_t zasProbki[7]; static uint8_t zasNp = 0; // wolny RAM w spoczynku, co godzine (ostatnie 7)
+static uint32_t zasOstrz[4] = {0, 0, 0, 0};             // czas ostatniego ostrzezenia: RAM, wyciek, petla, flash
+static uint16_t zasIle = 0;                             // liczba ostrzezen od startu
+static uint32_t zasFlashWolne() { FSInfo fi; LittleFS.info(fi); return (uint32_t)(fi.totalBytes - fi.usedBytes); }
 static String obciazenieTxt() {
   uint32_t tot = rp2040.getTotalHeap(), uz = rp2040.getUsedHeap();
   return " | RAM: " + String(uz / 1024) + "/" + String(tot / 1024) + " KB zajete (min. wolne " +
          String(ramMinWolne == 0xFFFFFFFF ? (tot - uz) / 1024 : ramMinWolne / 1024) + " KB) | petle: rdzen0 " + String(petla[0].hz) +
-         "/s, max " + String(petla[0].maxUs / 1000) + " ms; rdzen1 " + String(petla[1].hz) + "/s, max " + String(petla[1].maxUs / 1000) + " ms";
+         "/s, max " + String(petla[0].maxUs / 1000) + " ms (rekord " + String(zasRek[0] / 1000) + "); rdzen1 " + String(petla[1].hz) +
+         "/s, max " + String(petla[1].maxUs / 1000) + " ms (rekord " + String(zasRek[1] / 1000) + ") | ostrzezenia zasobow: " + String(zasIle);
+}
+String zasobyTxt() {                                    // komenda LoRa ZASOBY i wpis co 3 h (zapas: wolne / calosc)
+  uint32_t wol = rp2040.getFreeHeap(), tot = rp2040.getTotalHeap();
+  uint32_t mn = ramMinWolne == 0xFFFFFFFF ? wol : ramMinWolne;
+  FSInfo fi; LittleFS.info(fi);
+  String t = "PICO zasoby: RAM wolne " + String(wol / 1024) + "/" + String(tot / 1024) + " KB (" + String(tot ? wol * 100 / tot : 0) +
+             "%), min " + String(mn / 1024) + " KB (" + String(tot ? mn * 100 / tot : 0) + "%)";
+  if (zasRam10) t += ", po 10 min " + String(zasRam10 / 1024);
+  t += "; rdzen0 " + String(petla[0].hz) + "/s max " + String(zasRek[0] / 1000) + " ms; rdzen1 " + String(petla[1].hz) + "/s max " +
+       String(zasRek[1] / 1000) + " ms; flash wolne " + String((uint32_t)((fi.totalBytes - fi.usedBytes) / 1024)) + "/" +
+       String((uint32_t)(fi.totalBytes / 1024)) + " KB; " + String(millis() / 3600000UL) + " h; ostrz. " + String(zasIle) + (zasIle ? "" : " OK");
+  return t;
+}
+static void zasOstrzez(int rodzaj, const String& txt) {
+  zasIle++;
+  logf("[ZASOBY] UWAGA: %s\n", txt.c_str());
+  if (zasOstrz[rodzaj] && millis() - zasOstrz[rodzaj] < 86400000UL) return;   // LoRa najwyzej raz na dobe dla rodzaju
+  if (!cfg.zasLora) return;                             // opcja: ostrzezenia tylko w zdarzeniach
+  zasOstrz[rodzaj] = millis() | 1;
+  queueLora("PICO: UWAGA " + txt, 0);
+}
+void zasobyService() {                                  // rdzen 0, co 5 s
+  static uint32_t t5 = 0, tFw = 0, tGodz = 0, t3h = 0;
+  static uint32_t logRam = 0, logPetla = 0, logFlash = 0;   // wpis w zdarzeniach najwyzej co godzine
+  uint32_t now = millis();
+  if (now - t5 < 5000) return;
+  t5 = now;
+  if (pmFwOp() || seq) { tFw = now; return; }           // flashowanie, odbior, pobieranie, RTS: dlugie obiegi sa normalne
+  if (now < 60000 || now - tFw < 15000) return;          // start Pico i 15 s po operacji
+  for (int c = 0; c < 2; c++) {
+    uint32_t m = petla[c].maxUs; if (m > zasRek[c]) zasRek[c] = m;
+    uint32_t prog = (c == 0 ? ZAS_PETLA0_MS : ZAS_PETLA1_MS) * 1000;
+    if (m > prog && (!logPetla || now - logPetla > 3600000UL)) {
+      logPetla = now;
+      zasOstrzez(2, "rdzen " + String(c) + (c ? " (USB)" : " (siec)") + " zajety " + String(m / 1000) + " ms (prog " + String(prog / 1000000) + " s) - " +
+                  "Pico przeciazone, sprawdz zdarzenia");
+    }
+  }
+  uint32_t wol = rp2040.getFreeHeap();
+  if (!zasRam10 && now > 600000UL) zasRam10 = wol;
+  if (wol < ZAS_RAM_PROG && (!logRam || now - logRam > 3600000UL)) {
+    logRam = now;
+    zasOstrzez(0, "malo RAM - wolne " + String(wol / 1024) + " KB (prog " + String(ZAS_RAM_PROG / 1024) + " KB)");
+  }
+  uint32_t fl = zasFlashWolne();
+  if (fl < ZAS_FLASH_PROG && (!logFlash || now - logFlash > 3600000UL)) {
+    logFlash = now;
+    zasOstrzez(3, "malo miejsca we flashu - wolne " + String(fl / 1024) + " KB");
+  }
+  if (now - tGodz >= 3600000UL && !brActive && !upActive) {   // proba RAM w spoczynku co godzine
+    tGodz = now;
+    if (zasNp == 7) { memmove(zasProbki, zasProbki + 1, 6 * sizeof(uint32_t)); zasNp = 6; }
+    zasProbki[zasNp++] = wol;
+    if (zasNp == 7) {
+      bool spada = true;
+      for (int i = 1; i < 7; i++) if (zasProbki[i] + 1024 > zasProbki[i - 1]) spada = false;   // co godzine min. 1 KB mniej
+      if (spada && zasProbki[0] - zasProbki[6] >= ZAS_WYCIEK)
+        zasOstrzez(1, "mozliwy wyciek pamieci - wolny RAM spada od 6 h: " + String(zasProbki[0] / 1024) + " -> " + String(zasProbki[6] / 1024) + " KB");
+    }
+  }
+  if (now - t3h >= 3 * 3600000UL) { t3h = now; logf("[ZASOBY] %s\n", zasobyTxt().c_str() + 5); }   // slad w zdarzeniach co 3 h
 }
 void loop() {
   setupKoniec = true;
   petlaTik(0);
+  zasobyService();
   usbBootFixService();
   vsysService();
   { uint32_t beat = core1Beat; if ((int32_t)(millis() - beat) < 3000) rp2040.wdt_reset(); }
@@ -4116,12 +4195,13 @@ void loraCmdService() {
   bool help = !hasVal && key == "HELP", wersje = !hasVal && key == "WERSJE";
   bool dl = hasVal && key == "POBIERZ_INTERNET", upd = !hasVal && key == "AKTUALIZUJ_INTERNET";
   bool spij = key == "USPIJ_POWMAN", dgr = key == "DOWNGRADE", rst = key == "RESTART_PICO", pw = key == "PORT_WEZLA";
-  bool sol = !hasVal && key == "SOL", str = key == "STRONA";
-  if (setIdx < 0 && cmdIdx < 0 && !help && !wersje && !dl && !upd && !spij && !dgr && !rst && !pw && !sol && !str) return;   // zwykla wiadomosc na kanale
+  bool sol = !hasVal && key == "SOL", str = key == "STRONA", zas = !hasVal && key == "ZASOBY";
+  if (setIdx < 0 && cmdIdx < 0 && !help && !wersje && !dl && !upd && !spij && !dgr && !rst && !pw && !sol && !str && !zas) return;   // zwykla wiadomosc na kanale
   if (!senderAllowed(from)) { logf("[PICO] Komenda od niedozwolonego nadawcy !%08lx - pominieta\n", (unsigned long)from); return; }
   logf("[AUDYT] LoRa !%08lx KOMENDA %s\n", (unsigned long)from, key.c_str());
   { char k[20]; snprintf(k, sizeof(k), "LoRa !%08lx", (unsigned long)from); if (dl || upd) opKto = k; }
   pmExtend();                                                // komenda w czasie czuwania POWMAN przedluza czuwanie
+  if (zas) { queueLora(zasobyTxt(), 0); return; }
   if (sol) { queueLora("PICO " + cfg.picoId + ": sol hasla strony " + cfg.tokSol + " (dla skryptu: --sol " + cfg.tokSol + ")", 0); return; }
   if (str) {                                                 // strona WWW Pico (port 80: przegladarka i skrypt)
     String v = val; v.toUpperCase();
@@ -4182,7 +4262,7 @@ void loraCmdService() {
   if (help) {
     String l = "PICO komendy: HELP";
     for (int i = 0; i < 5; i++) l += ", " + cfg.cmd[i];
-    l += ", WERSJE, USPIJ_POWMAN, RESTART_PICO, DOWNGRADE, AKTUALIZUJ_INTERNET, SOL, STRONA:WL/WYL";
+    l += ", WERSJE, ZASOBY, USPIJ_POWMAN, RESTART_PICO, DOWNGRADE, AKTUALIZUJ_INTERNET, SOL, STRONA:WL/WYL";
     queueLora(l, 0);                                         // 1/5: komendy
     queueLora("PICO ustawienia: AP_SSID:, AP_PWD:, STA_SSID:, STA_PWD:, MODE_WIFI:, TRYB_SIECI:, IPW:, IPE:, FILTR_NODE:, ADRES_URL:, BRAK_ODPOWIEDZI:, "
               "IP_DOZWOLONE:, HOP:, POBIERZ_INTERNET:typ:PIASEK", 0);   // 2/5
