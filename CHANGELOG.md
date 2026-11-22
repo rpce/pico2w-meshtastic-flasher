@@ -4,11 +4,26 @@ Program Pico i skrypt `wyslij_firmware.py` mają zawsze ten sam numer wersji.
 
 Pomysłodawca projektu: Rafał Cichosz (rpc) · Kodowanie: Claude Opus 5.5
 
+## [0.44] – 2026-11-22
+
+### Dodane
+- **Kompresja logów węzła we flashu** (gzip, ok. 5×): kawałki po 32 KB tekstu, każdy jako osobny plik. *Pobierz logi z flash* na stronie daje rozpakowany .txt (rozpakowuje Pico), skrypt `--logi` pobiera .gz i rozpakowuje sam.
+- **Dynamiczne miejsce na logi węzła**: zajmują całe wolne miejsce we flashu (zapas 256 KB), najstarsze kawałki znikają, gdy brakuje miejsca – także przed przyjęciem pakietu firmware (skrypt, strona, internet). Pasek stanu pokazuje, ile logu jest we flashu, na ile godzin starcza i stopień kompresji.
+- **Ustawienie *Zapis logów węzła do flasha*** (domyślnie tak; skrypt `LOGI_FLASH=TAK/NIE`) – nie = logi węzła tylko w RAM.
+- **Ustawienie *Filtr logów*** (skrypt `FILTR_LOGOW`): fragmenty oddzielone `;`, linie z nimi nie trafiają do flasha. Domyślnie puste = pełne logi.
+
+### Zmienione
+- Log węzła w RAM: 96 KB (było 48 KB); zapis do flasha po 32 KB albo co godzinę, zawsze do końca pełnej linii.
+- Zdarzenia Pico zapisywane we flashu (2 × 32 KB, chronione – nigdy nie usuwane na pakiet); *Pobierz zdarzenia Pico* pokazuje też zdarzenia sprzed restartów.
+- Próg przeciążenia rdzenia 1 (USB): 5 s (wysłanie wiadomości LoRa przez API trwa normalnie do ok. 2,5 s).
+- *Pobierz log* wysyłany strumieniowo, podgląd na żywo pokazuje ostatnie 24 KB.
+- Stare pliki logu `/log_a.txt`, `/log_b.txt` są usuwane przy pierwszym starcie.
+
 ## [0.41] – 2026-11-21
 
 ### Dodane
 - **Kontrola zasobów Pico**: rekordy od startu (najmniej wolnego RAM, najdłuższy obieg pętli rdzenia 0 i 1), wolny RAM 10 min po starcie, wolne miejsce we flashu.
-- **Ostrzeżenia w zdarzeniach i przez LoRa** (każdy rodzaj najwyżej raz na dobę): mało RAM (< 30 KB), możliwy wyciek pamięci (wolny RAM w spoczynku spada co godzinę przez 6 h, łącznie ≥ 16 KB), przeciążony rdzeń (obieg pętli > 5 s rdzeń 0, > 1 s rdzeń 1), mało miejsca we flashu (< 48 KB). Bez ostrzeżeń w trakcie operacji na firmware.
+- **Ostrzeżenia w zdarzeniach i przez LoRa** (każdy rodzaj najwyżej raz na dobę): mało RAM (< 30 KB), możliwy wyciek pamięci (wolny RAM w spoczynku spada co godzinę przez 6 h, łącznie ≥ 16 KB), przeciążony rdzeń (obieg pętli > 5 s na każdym rdzeniu), mało miejsca we flashu (< 48 KB). Bez ostrzeżeń w trakcie operacji na firmware.
 - **Ustawienie *Ostrzeżenia zasobów przez LoRa*** (domyślnie tak, skrypt `ZASOBY_LORA=TAK/NIE`) – przez LoRa idą tylko alarmy; wyłączone = sam wpis w zdarzeniach.
 - **Komenda LoRa `ZASOBY`** – stan zasobów w jednej wiadomości; wpis `[ZASOBY]` w zdarzeniach co 3 h; rekordy i liczba ostrzeżeń w pasku stanu strony.
 - Odpowiedź `ZASOBY` pokazuje zapas: wolne z całości i procent (RAM, flash), obiegi pętli na sekundę obu rdzeni.

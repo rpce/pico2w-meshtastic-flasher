@@ -1,6 +1,6 @@
 # Pico2W flasher – zdalny flasher i zbieracz logów dla węzła Meshtastic (ESP32-S3)
 
-**Aktualna wersja: 0.41**
+**Aktualna wersja: 0.44**
 
 - **Pomysłodawca projektu:** Rafał Cichosz (rpc)
 - **Kodowanie:** Claude Opus 5.5
@@ -14,7 +14,8 @@ Raspberry Pi Pico 2 W podłączone przez USB do węzła Meshtastic na ESP32-S3 p
 - Wgrywanie firmware węzła skryptem przez sieć: pełna instalacja (factory + OTA + LittleFS), aktualizacja bez utraty ustawień, samo OTA, sama konfiguracja (z kopii YAML lub `.cfg`).
 - Firmware zawsze trafia najpierw do pamięci Pico i jest sprawdzany, dopiero potem do węzła. Dziennik etapów dokańcza wgrywanie po zaniku zasilania lub restarcie Pico (do 3 prób na etap).
 - Sieć: Wi-Fi AP, Wi-Fi STA (z zapasowym AP), Ethernet W5500-mini albo HAT W5100S (**nieprzetestowany**) albo bez sieci (tylko LoRa).
-- Logi węzła w RAM i we flashu Pico, osobno zapisane 2 ostatnie starty węzła; podgląd na stronie, pobieranie przyciskiem lub skryptem. Pico samo włącza na węźle opcję Debug log, więc logi płyną także po komendach LoRa.
+- Logi węzła: 96 KB w RAM i historia we flashu Pico **skompresowana (ok. 5×)**, zajmująca wolne miejsce (najstarsze kawałki usuwane, także przed przyjęciem pakietu firmware); opcjonalny filtr linii, zapis do flasha można wyłączyć. Jeden plik do pobrania ze strony lub skryptem. Osobno 2 ostatnie starty węzła i zdarzenia Pico (chronione, także sprzed restartów). Pico samo włącza na węźle opcję Debug log, więc logi płyną także po komendach LoRa.
+- Kontrola zasobów Pico: wolny RAM, obciążenie rdzeni, wolny flash, wykrywanie wycieku pamięci; ostrzeżenia w zdarzeniach i (opcjonalnie) przez LoRa, stan komendą `ZASOBY`.
 - Sterowanie komendami LoRa (lista: `HELP`) wyłącznie na prywatnym kanale z kluczem 256-bit, odpowiedzi z ustawianym hop limit.
 - Pobieranie aktualizacji z własnego serwera (`mtnod.txt` podpisany HMAC, SHA-256 każdego pakietu, zaszyfrowana konfiguracja).
 - Zdalna aktualizacja programu samego Pico z zachowaniem ustawień.
@@ -24,7 +25,7 @@ Raspberry Pi Pico 2 W podłączone przez USB do węzła Meshtastic na ESP32-S3 p
 - Strona WWW z logowaniem (stronę można wyłączyć komendą `STRONA:WYL`, skrypt działa dalej); te same ustawienia ze strony, skryptu i LoRa.
 - Skrypt `wyslij_firmware.py` (Linux, Windows) do pobrania ze strony Pico – zawsze w wersji zgodnej z programem.
 
-Pełny opis: [docs/Pico2W_flasher_instrukcja_0.41.pdf](docs/Pico2W_flasher_instrukcja_0.41.pdf)
+Pełny opis: [docs/Pico2W_flasher_instrukcja_0.44.pdf](docs/Pico2W_flasher_instrukcja_0.44.pdf)
 
 ## Pliki
 
