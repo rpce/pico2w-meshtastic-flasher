@@ -24,7 +24,7 @@ Raspberry Pi Pico 2 W podłączone przez USB do węzła Meshtastic na ESP32-S3 p
 - Strona WWW z logowaniem (stronę można wyłączyć komendą `STRONA:WYL`, skrypt działa dalej); te same ustawienia ze strony, skryptu i LoRa.
 - Skrypt `wyslij_firmware.py` (Linux, Windows) do pobrania ze strony Pico – zawsze w wersji zgodnej z programem.
 
-Pełny opis: [docs/Pico2W_flasher_instrukcja_0.40.pdf](docs/Pico2W_flasher_instrukcja_0.40.pdf)
+Pełny opis: [docs/Pico2W_flasher_instrukcja_0.41.pdf](docs/Pico2W_flasher_instrukcja_0.41.pdf)
 
 ## Pliki
 
