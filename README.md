@@ -1,6 +1,6 @@
 # Pico2W flasher – zdalny flasher i zbieracz logów dla węzła Meshtastic (ESP32-S3)
 
-**Aktualna wersja: 0.44**
+**Aktualna wersja: 0.48**
 
 - **Pomysłodawca projektu:** Rafał Cichosz (rpc)
 - **Kodowanie:** Claude Opus 5.5
@@ -24,8 +24,13 @@ Raspberry Pi Pico 2 W podłączone przez USB do węzła Meshtastic na ESP32-S3 p
 - Tryb POWMAN: głęboki sen Pico (ok. 0,3–1 mA) z pobudką timerem albo pinem GP14.
 - Strona WWW z logowaniem (stronę można wyłączyć komendą `STRONA:WYL`, skrypt działa dalej); te same ustawienia ze strony, skryptu i LoRa.
 - Skrypt `wyslij_firmware.py` (Linux, Windows) do pobrania ze strony Pico – zawsze w wersji zgodnej z programem.
+- Kontrola płytki: Pico nie wgra firmware innej płytki niż podłączony węzeł (nazwa builda i model sprzętu) – odmowa już na początku wysyłania, nic nie jest usuwane.
+- Logi mailem (SMTP z TLS): po restarcie węzła, co tydzień/codziennie, przed rotacją, na żądanie (strona, skrypt, LoRa) i alarm o nieudanym logowaniu z adresem IP.
+- Termostat na GP15 (grzałka/wentylator) z histerezą, blokadą 60 s między przełączeniami i stanem awaryjnym.
+- Modbus RTU przez konwerter TTL↔RS485 (GP0/GP1/GP2), do 8 odczytów jako telemetria Meshtastic (**nieprzetestowany**).
+- Ustawienia i zdarzenia w osobnym małym systemie plików, zapis bezpieczny (plik tymczasowy + kopia); stała sesja API z węzłem – komendy LoRa działają niezależnie od logu węzła (firmware 2.8.x).
 
-Pełny opis: [docs/Pico2W_flasher_instrukcja_0.44.pdf](docs/Pico2W_flasher_instrukcja_0.44.pdf)
+Pełny opis: [docs/Pico2W_flasher_instrukcja_0.48.pdf](docs/Pico2W_flasher_instrukcja_0.48.pdf)
 
 ## Pliki
 
@@ -37,13 +42,13 @@ Pełny opis: [docs/Pico2W_flasher_instrukcja_0.44.pdf](docs/Pico2W_flasher_instr
 | `docs/` | instrukcja PDF i schematy |
 | `CHANGELOG.md` | dziennik zmian |
 
-Gotowe pliki (`.uf2` do pierwszego wgrania, `.bin` do aktualizacji Pico) są w zakładce [Releases](https://github.com/rpce/pico2w-meshtastic-flasher/releases).
+Gotowe pliki `pico2w_flasher_<wersja>.uf2` (pierwsze wgranie) i `pico2w_flasher_<wersja>.bin` (aktualizacja Pico, np. `--pico-fw pico2w_flasher_0.48.bin`) są w zakładce [Releases](https://github.com/rpce/pico2w-meshtastic-flasher/releases).
 
 Program Pico i skrypt mają zawsze ten sam numer wersji – używaj ich w parze.
 
 ## Szybki start
 
-1. Przytrzymaj BOOTSEL, podłącz Pico do komputera i skopiuj plik `.uf2` na dysk RP2350.
+1. Przytrzymaj BOOTSEL, podłącz Pico do komputera i skopiuj plik `pico2w_flasher_<wersja>.uf2` na dysk RP2350.
 2. Połącz się z siecią Wi-Fi **FlasherMeshtasticPico2W** (hasło `12345678`) i wejdź na `http://192.168.4.1`. Zaloguj się hasłem `MojeBezpieczneHaslo123` – Pico od razu wymusi nowe hasła strony i AP (min. 12 znaków).
 3. Podłącz węzeł ESP32-S3 kablem USB do Pico.
 4. Na węźle ustaw kanał komend jako **prywatny z kluczem 256-bit**.
@@ -55,12 +60,15 @@ Program Pico i skrypt mają zawsze ten sam numer wersji – używaj ich w parze.
 - Płytka: Raspberry Pi Pico 2 W; USB Stack: **Adafruit TinyUSB Host (native)**; Flash Size: **4MB (Sketch: 1MB, FS: 3MB)**.
 - Łatki biblioteki TinyUSB (`tusb_config_rp2040.h`, `hcd_rp2040.c`, `rp2040_usb.c`) – opis w instrukcji.
 - `skrypt_py.h` musi leżeć w folderze szkicu obok `.ino` i mieć tę samą wersję, inaczej kompilacja zatrzyma się z komunikatem.
+- Program musi mieć mniej niż **974 848 B** (ostatnie 64 KB obszaru programu to system plików na ustawienia i zdarzenia). Nie wgrywaj z opcją *Erase Flash: All*.
 
 ## Sprzęt
 
 - Zasilanie 5 V (5,2 V przy diodzie Schottky'ego), min. 2,4 A, do VSYS (pin 39) i GND (pin 38); VSYS z VBUS (pin 40) przez diodę, mostek albo wyłącznik TPS2552D/TPS2553.
 - Wyjście resetu węzła: **GP22 (pin 29)** – steruje modułem z tranzystorem/MOSFET albo wyłącznikiem **TPS2552D** / **TPS2553DBVR** (schematy w `docs/`).
 - Opcjonalnie pobudka z POWMAN pinem **GP14** z wolnego GPIO węzła (Remote Hardware).
+- Wyjście termostatu: **GP15 (pin 20)** przez MOSFET albo moduł przekaźnika.
+- Modbus: UART TTL 3,3 V – **GP0 (pin 1) TX, GP1 (pin 2) RX, GP2 (pin 4) DE/RE** – do konwertera TTL↔RS485 (moduł na 3,3 V) – **nieprzetestowane**.
 - Ethernet: W5500-mini (GP8–GP13) albo HAT W5100S (GP16–GP21) – opcje nieprzetestowane, mogą nie działać.
 
 ## English summary
